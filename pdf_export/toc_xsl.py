@@ -1,9 +1,18 @@
 """
 wkhtmltopdf 目录 XSL 生成模块。
 
-使用真实 HTML <table> 实现「标题 ……… 页码」三列横向布局。
+布局：真实 HTML <table> 三列横排（标题 | 虚线 | 页码）。
 wkhtmltopdf 内嵌的旧版 WebKit（Qt 4.x）对 CSS display:table-cell
 支持有缺陷，会将各列竖向堆叠；真实 <table> 标签可彻底规避该问题。
+
+遍历策略（关键！避免重复条目）：
+  根模板只 select 根 outline:item 的直接子节点（outline:item/outline:item），
+  赋予 mode="l1"。l1 模板渲染自身后，递归 select 子节点 mode="l2"，
+  l2 再递归 mode="l3"。
+
+  **切勿使用 //outline:item**：
+  //（descendant-or-self 轴）会把所有深度的节点一次性拉平匹配，
+  然后模板内再递归子节点，导致每个嵌套条目被渲染 N 次。
 """
 
 
@@ -39,7 +48,8 @@ def write_toc_xsl(xsl_path: str) -> None:
             font-family: "SimSun", "宋体", "Microsoft YaHei", serif;
             font-size: 12pt;
             color: #000;
-            padding: 28px 36px;
+            padding: 2cm 2.5cm;
+            line-height: 1.8;
           }
           h1.toc-heading {
             text-align: center;
@@ -88,13 +98,14 @@ def write_toc_xsl(xsl_path: str) -> None:
       <body>
         <h1 class="toc-heading">&#x76EE;&#x3000;&#x3000;&#x5F55;</h1>
         <table class="toc-table">
+          <!-- 只选根节点的直接子项，不用 // -->
           <xsl:apply-templates select="outline:item/outline:item" mode="l1"/>
         </table>
       </body>
     </html>
   </xsl:template>
 
-  <!-- 一级条目 -->
+  <!-- 一级条目：渲染自身，然后递归直接子节点为二级 -->
   <xsl:template match="outline:item" mode="l1">
     <xsl:if test="normalize-space(@title) != '' and not(starts-with(@title, 'Chapter'))">
       <tr class="l1">
@@ -111,7 +122,7 @@ def write_toc_xsl(xsl_path: str) -> None:
     </xsl:if>
   </xsl:template>
 
-  <!-- 二级条目 -->
+  <!-- 二级条目：渲染自身，然后递归直接子节点为三级 -->
   <xsl:template match="outline:item" mode="l2">
     <xsl:if test="normalize-space(@title) != '' and not(starts-with(@title, 'Chapter'))">
       <tr class="l2">
@@ -128,7 +139,7 @@ def write_toc_xsl(xsl_path: str) -> None:
     </xsl:if>
   </xsl:template>
 
-  <!-- 三级条目 -->
+  <!-- 三级条目：叶节点，不再递归 -->
   <xsl:template match="outline:item" mode="l3">
     <xsl:if test="normalize-space(@title) != '' and not(starts-with(@title, 'Chapter'))">
       <tr class="l3">

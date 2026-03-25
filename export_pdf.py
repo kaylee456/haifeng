@@ -3,19 +3,13 @@ PDF 全量导出模块
 ================
 生成带可点击目录（标书格式）的完整项目 PDF。
 
-目录格式：
-  第一章 XXX ........... 1
-    1.1 YYY ........ 2
-      1.1.1 ZZZ ... 3
+目录使用 wkhtmltopdf 内置 outline + 自定义 XSL 生成。
+XSL 中使用真实 HTML <table> 实现横向三列布局（标题 … 页码），
+避免旧版 WebKit 对 CSS display:table-cell 的兼容问题。
 
-• 目录条目可点击跳转（wkhtmltopdf outline + XSL <a> 链接）
-• 一级/二级/三级标题依次缩进
-• 不出现重复章节名称或孤立数字行
-• 新顶层章节另起一页
-
-TOC 布局使用真实 HTML <table> 元素而非 CSS display:table，
-因为 wkhtmltopdf 内置的旧版 WebKit 对 display:table-cell 支持不完善，
-会将 title / dots / page 竖向堆叠而非横向排列。
+TOC 条目遍历采用「从根直接子节点出发，逐级递归」策略
+（outline:item/outline:item → mode="l1"），而非 //outline:item，
+以避免同一条目被 flat 匹配 + 递归匹配双重渲染导致的重复。
 """
 
 from datetime import datetime
@@ -143,36 +137,6 @@ def clean_latex_safe(html: str) -> str:
     return re.sub(r"\s+", " ", html).strip()
 
 
-def _build_section_title(fname: str, content: str) -> str:
-    """
-    从章节 HTML 内的第一个 h1/h2/h3 提取可读标题。
-    若找不到则从文件名生成：Chapter10-2-1_result.html -> "第10章 2-1节"
-    """
-    m = re.search(r"<h[1-3][^>]*>(.*?)</h[1-3]>", content, flags=re.IGNORECASE | re.DOTALL)
-    if m:
-        t = _strip_html_tags(m.group(1))
-        if t:
-            return t
-
-    base = fname.replace("_result.html", "")
-    m2 = re.match(r"^Chapter(\d+)-(.+)$", base)
-    if m2:
-        return f"第{m2.group(1)}章 {m2.group(2)}节"
-    return base
-
-
-def _determine_heading_level(fname: str) -> int:
-    """
-    根据文件名中连字符数量判断标题层级：
-    Chapter10_result.html   -> 1
-    Chapter10-2_result.html -> 2
-    Chapter10-2-1_result.html -> 3
-    """
-    base = fname.replace("_result.html", "")
-    parts = base.split("-")
-    return min(len(parts), 3)
-
-
 def _sanitize_stray_numeric_lines(content: str) -> str:
     """
     去除章节体内孤立的纯数字段落（目录残留序号）。
@@ -189,19 +153,16 @@ def _write_toc_xsl(xsl_path: str) -> None:
     """
     生成标书风格目录样式表。
 
-    使用真实 HTML <table> 而非 CSS display:table-cell 来实现
-    「标题 ……… 页码」的三列横向布局。wkhtmltopdf 内嵌的旧版
-    WebKit（Qt 4.x）对 display:table-cell 支持有缺陷，会将
-    各 <span> 竖向堆叠；改用 <table><tr><td> 可彻底规避该问题。
+    布局：真实 HTML <table> 三列横排（标题 | 虚线 | 页码）。
 
-    布局方案：
-      <table width="100%">
-        <col style="width:auto"/>           ← 标题（自适应收缩）
-        <col style="width:100%"/>           ← 虚线（拉伸填满剩余）
-        <col style="width:1px"/>            ← 页码（收缩到内容）
-      </table>
+    遍历策略（关键！避免重复条目）：
+      根模板只 select 根 outline:item 的直接子节点（outline:item/outline:item），
+      赋予 mode="l1"。l1 模板渲染自身后，递归 select 子节点 mode="l2"，
+      l2 再递归 mode="l3"。
 
-    三级标题通过 padding-left 实现左侧缩进。
+      **切勿使用 //outline:item**：
+      //（descendant-or-self 轴）会把所有深度的节点一次性拉平匹配，
+      然后模板内再递归子节点，导致每个嵌套条目被渲染 N 次。
     """
     xsl = r"""<?xml version="1.0" encoding="UTF-8"?>
 <xsl:stylesheet version="1.0"
@@ -219,7 +180,8 @@ def _write_toc_xsl(xsl_path: str) -> None:
             font-family: "SimSun", "宋体", "Microsoft YaHei", serif;
             font-size: 12pt;
             color: #000;
-            padding: 28px 36px;
+            padding: 2cm 2.5cm;
+            line-height: 1.8;
           }
           h1.toc-heading {
             text-align: center;
@@ -268,13 +230,14 @@ def _write_toc_xsl(xsl_path: str) -> None:
       <body>
         <h1 class="toc-heading">&#x76EE;&#x3000;&#x3000;&#x5F55;</h1>
         <table class="toc-table">
+          <!-- 只选根节点的直接子项，不用 // -->
           <xsl:apply-templates select="outline:item/outline:item" mode="l1"/>
         </table>
       </body>
     </html>
   </xsl:template>
 
-  <!-- 一级条目 -->
+  <!-- 一级条目：渲染自身，然后递归直接子节点为二级 -->
   <xsl:template match="outline:item" mode="l1">
     <xsl:if test="normalize-space(@title) != '' and not(starts-with(@title, 'Chapter'))">
       <tr class="l1">
@@ -291,7 +254,7 @@ def _write_toc_xsl(xsl_path: str) -> None:
     </xsl:if>
   </xsl:template>
 
-  <!-- 二级条目 -->
+  <!-- 二级条目：渲染自身，然后递归直接子节点为三级 -->
   <xsl:template match="outline:item" mode="l2">
     <xsl:if test="normalize-space(@title) != '' and not(starts-with(@title, 'Chapter'))">
       <tr class="l2">
@@ -308,7 +271,7 @@ def _write_toc_xsl(xsl_path: str) -> None:
     </xsl:if>
   </xsl:template>
 
-  <!-- 三级条目 -->
+  <!-- 三级条目：叶节点，不再递归 -->
   <xsl:template match="outline:item" mode="l3">
     <xsl:if test="normalize-space(@title) != '' and not(starts-with(@title, 'Chapter'))">
       <tr class="l3">
@@ -500,23 +463,6 @@ def export_full_project_pdf(project_id: str):
                 merged_sections.append('<div class="chapter-break"></div>')
             prev_top_chapter = cur_top
 
-            title = _build_section_title(fname, content)
-            level = _determine_heading_level(fname)
-            heading_class = f"sec-h{level}"
-
-            anchor_id = fname.replace("_result.html", "").replace(".", "-")
-            merged_sections.append(
-                f'<h{level} class="{heading_class}" id="{anchor_id}">{title}</h{level}>'
-            )
-
-            first_hx = re.search(
-                r"<h[1-3][^>]*>.*?</h[1-3]>", content, flags=re.IGNORECASE | re.DOTALL
-            )
-            if first_hx:
-                inner_title = _strip_html_tags(first_hx.group(0))
-                if inner_title.strip() == title.strip():
-                    content = content[: first_hx.start()] + content[first_hx.end() :]
-
             merged_sections.append(f'<section data-source="{fname}">{content}</section>')
 
         except Exception as exc:
@@ -563,7 +509,6 @@ def export_full_project_pdf(project_id: str):
     }
 
     toc = {
-        "toc-header-text": "目录",
         "xsl-style-sheet": toc_xsl_path,
     }
 
