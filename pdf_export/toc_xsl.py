@@ -45,9 +45,14 @@ def write_toc_xsl(xsl_path: str) -> None:
           }
           li { margin: 0; }
 
+          /*
+           * 勿对标题列用 width:1% + 宽 100% 中间列：旧版 WebKit/wkhtmltopdf 会把标题压成极窄，
+           * 中文出现「一字一行」；勿用 word-break:break-word，易逐字断开。
+           */
           .toc-row {
             display: table;
             width: 100%;
+            table-layout: fixed;
             border-spacing: 0;
             padding: 3px 0;
             font-weight: normal;
@@ -56,15 +61,15 @@ def write_toc_xsl(xsl_path: str) -> None:
           }
           .toc-title {
             display: table-cell;
+            width: 52%;
             white-space: normal;
-            word-break: break-word;
+            word-break: normal;
             vertical-align: baseline;
-            width: 1%;
           }
           .toc-dots {
             display: table-cell;
+            width: 38%;
             vertical-align: baseline;
-            width: 100%;
             padding: 0 6px;
             background-image: radial-gradient(circle, #333 1px, transparent 1px);
             background-size: 6px 1px;
@@ -73,10 +78,10 @@ def write_toc_xsl(xsl_path: str) -> None:
           }
           .toc-page {
             display: table-cell;
+            width: 10%;
             white-space: nowrap;
             text-align: right;
             vertical-align: baseline;
-            width: 1%;
             padding-left: 4px;
           }
 
