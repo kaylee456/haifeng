@@ -1,9 +1,5 @@
 """Basic tests for pdf_export_service module."""
 
-import os
-import tempfile
-
-import pytest
 from fastapi.testclient import TestClient
 
 import main
