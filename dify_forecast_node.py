@@ -111,37 +111,51 @@ def is_monotonic(data: np.ndarray, window: int = 10):
 # ======================== 核心预测策略 ========================
 def forecast_pattern_replay(data: np.ndarray, period: int, steps: int) -> list:
     """
-    【主策略，高波动数据】去趋势 → 残差周期复现 → 重新加趋势
+    【主策略，高波动数据】历史波动直接重播，可选叠加趋势
 
-    流程：
-      1. 对全段数据拟合线性趋势
-      2. 计算残差 = data - trend
-      3. 取最近 period 个残差作为循环模板
-      4. 预测值 = 未来趋势 + 残差循环值
+    两种模式自动切换：
 
-    优点：无累积漂移，完全保留历史波动幅度。
+    模式A（近零趋势，slope/std < 0.05）：
+      直接重播最近 n 个历史值，不做去趋势。
+      replay 起始位置 = max(0, n - steps)，即从最近 steps 步的历史数据
+      开始接续，让预测与历史尾部自然衔接。
+      → 预测形状与历史分布完全一致，无任何漂移。
+
+    模式B（显著趋势，slope/std >= 0.05）：
+      去趋势 → 以最近 n 个残差为循环模板 → 叠加未来趋势。
+      → 保留波动特征的同时延续趋势方向。
+
+    两种模式均以全量历史（n 个点）为循环模板，不依赖 period，
+    从而避免 period 很小（如 3）时的机械重复问题。
     """
     n = len(data)
     slope, intercept = linear_trend(data)
+    data_std = float(np.std(data)) + 1e-10
 
-    # 残差
-    trend_vals = slope * np.arange(n) + intercept
-    residuals = data - trend_vals
+    # 斜率相对于数据波动是否显著
+    trend_significant = abs(slope) / data_std >= 0.05
 
-    # 取最近 period 个残差为循环模板
-    pattern_len = max(2, min(period, n))
-    pattern = residuals[-pattern_len:].tolist()
+    # 从最近 steps 步之前的位置开始重播，使预测与历史尾部衔接
+    start = max(0, n - steps)
 
-    # 最后一个数据点对应的趋势值
-    last_trend = slope * (n - 1) + intercept
-
-    forecast = []
-    for i in range(steps):
-        future_trend = last_trend + slope * (i + 1)
-        residual = pattern[i % pattern_len]
-        forecast.append(future_trend + residual)
-
-    return forecast
+    if not trend_significant:
+        # 模式A：直接重播原始值
+        forecast = []
+        for i in range(steps):
+            idx = (start + i) % n
+            forecast.append(float(data[idx]))
+        return forecast
+    else:
+        # 模式B：去趋势后重播残差，叠加未来趋势
+        trend_vals = slope * np.arange(n) + intercept
+        residuals = data - trend_vals
+        last_trend = slope * (n - 1) + intercept
+        forecast = []
+        for i in range(steps):
+            idx = (start + i) % n
+            future_trend = last_trend + slope * (i + 1)
+            forecast.append(future_trend + float(residuals[idx]))
+        return forecast
 
 
 def forecast_holt_winters(data: np.ndarray, period: int, steps: int) -> list:
