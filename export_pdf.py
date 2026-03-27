@@ -353,7 +353,17 @@ _DOTS = "·" * 200
 
 
 def _toc_css() -> str:
-    """返回目录专用 CSS（放在 <head> 里）。"""
+    """
+    返回目录专用 CSS（放在 <head> 里）。
+
+    虚线布局采用经典 float 引导线：
+      - .toc-page  float:right  先渲染占据右侧
+      - .toc-row   display:block; overflow:hidden  包住标题+点
+      - .toc-title float:left   标题靠左
+      - .toc-dots  display:block; overflow:hidden  剩余宽度自动填满点字符
+
+    点字符紧接标题，不留固定宽度列的空白。
+    """
     return """
   h1.toc-heading {
     text-align: center;
@@ -362,72 +372,67 @@ def _toc_css() -> str:
     letter-spacing: 0.4em;
     margin: 0 0 10mm 0;
   }
-  /* !important 覆盖正文全局 table/td border 规则，确保目录表格无框线 */
-  table.toc-table {
-    width: 100% !important;
-    border-collapse: collapse !important;
-    border: none !important;
-    table-layout: fixed !important;
-    margin: 0 !important;
+  .toc-entry {
+    display: block;
+    overflow: hidden;
+    line-height: 2;
+    margin: 1px 0;
   }
-  table.toc-table td {
-    border: none !important;
-    padding: 2px 0 !important;
-    vertical-align: bottom !important;
-    line-height: 2 !important;
-    text-align: left !important;
-    background: transparent !important;
+  .toc-page {
+    float: right;
+    white-space: nowrap;
+    padding-left: 4px;
   }
-  td.toc-title {
-    width: 60%;
-    white-space: normal;
-    word-break: normal;
-    padding-right: 4px !important;
+  .toc-title {
+    float: left;
+    white-space: nowrap;
+    padding-right: 4px;
   }
-  td.toc-dots {
-    width: 30%;
+  .toc-dots {
+    display: block;
     overflow: hidden;
     white-space: nowrap;
-    vertical-align: bottom !important;
     color: #555;
-    padding: 0 2px !important;
   }
-  td.toc-page {
-    width: 10%;
-    white-space: nowrap;
-    text-align: right !important;
-    padding-left: 4px !important;
-  }
-  tr.lvl-1 td.toc-title { font-weight: 700;   font-size: 12pt;   padding-left: 0 !important; }
-  tr.lvl-2 td.toc-title { font-weight: normal; font-size: 11pt;   padding-left: 2em !important; }
-  tr.lvl-3 td.toc-title { font-weight: normal; font-size: 10.5pt; padding-left: 4em !important; color: #333; }
+  .lvl-1 .toc-title { font-weight: 700;   font-size: 12pt;   padding-left: 0; }
+  .lvl-2 .toc-title { font-weight: normal; font-size: 11pt;   padding-left: 2em; }
+  .lvl-3 .toc-title { font-weight: normal; font-size: 10.5pt; padding-left: 4em; color: #333; }
 """
 
 
-def _build_toc_rows(headings: list[dict]) -> str:
+def _build_toc_entries(headings: list[dict]) -> str:
     """
-    构建目录表格行 HTML（仅 <tr> 片段，不含 style/table 标签）。
-    style 已提取到 _toc_css()，在 <head> 里统一注入。
+    构建目录条目 HTML（div.toc-entry 列表，不使用 table）。
+
+    布局（float 引导线）：
+      <div class="toc-entry lvl-N">
+        <span class="toc-page">页码</span>   ← float:right，先渲染
+        <span class="toc-title">标题</span>  ← float:left
+        <span class="toc-dots">···</span>    ← display:block overflow:hidden，自动填满
+      </div>
+
+    页码 span 必须在标题 span 之前出现（先 float:right），
+    这样 overflow:hidden 的点才能填满标题到页码之间的剩余空间。
     """
     if not headings:
-        return "<tr><td colspan='3' style='text-align:center;padding-top:20mm;'>未生成目录条目</td></tr>"
+        return "<p style='text-align:center;padding-top:20mm;'>未生成目录条目</p>"
 
     min_level = min(h["level"] for h in headings)
     level_offset = min_level - 1
 
-    rows = []
+    entries = []
     for h in headings:
         display_level = min(max(1, h["level"] - level_offset), 3)
         title = html.escape(h["title"])
         page  = html.escape(str(h.get("page", "")))
-        rows.append(
-            f"<tr class='lvl-{display_level}'>"
-            f"<td class='toc-title'>{title}</td>"
-            f"<td class='toc-dots'>{_DOTS}</td>"
-            f"<td class='toc-page'>{page}</td>"
-            f"</tr>"
+        entries.append(
+            f"<div class='toc-entry lvl-{display_level}'>"
+            f"<span class='toc-page'>{page}</span>"
+            f"<span class='toc-title'>{title}</span>"
+            f"<span class='toc-dots'>{_DOTS}</span>"
+            f"</div>"
         )
-    return "".join(rows)
+    return "".join(entries)
 
 
 # ===========================================================================
@@ -547,7 +552,7 @@ def _build_combined_html(output_dir: str, headings_with_pages: list[dict], body_
     base_href_m = re.search(r"<base href='([^']+)'", body_sections_html)
     base_href = base_href_m.group(1) if base_href_m else ""
 
-    toc_rows = _build_toc_rows(headings_with_pages)
+    toc_entries = _build_toc_entries(headings_with_pages)
 
     head_css = "<style>\n" + (
         "  * { box-sizing: border-box; }\n"
@@ -569,17 +574,15 @@ def _build_combined_html(output_dir: str, headings_with_pages: list[dict], body_
         "  td, th { border: 1px solid #555 !important; padding: 6px 10px; text-align: center; }\n"
         "  th { background: #f0f0f0; }\n"
         "  .chapter-break { display: block; page-break-before: always; break-before: page; height: 0; margin: 0; padding: 0; }\n"
-        "  .toc-section { padding: 0; }\n"
         "  .toc-body-sep { display: block; page-break-before: always; break-before: page; height: 0; margin: 0; padding: 0; }\n"
         "</style>"
     )
 
     toc_block = (
-        "<div class='toc-section'>"
+        "<div>"
         "<h1 class='toc-heading'>目&#x3000;&#x3000;录</h1>"
-        "<table class='toc-table'>"
-        + toc_rows
-        + "</table></div>"
+        + toc_entries
+        + "</div>"
     )
 
     return (
