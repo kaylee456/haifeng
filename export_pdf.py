@@ -350,36 +350,15 @@ def _parse_outline_pages(xml_path: str) -> list[int]:
 _DOTS = "·" * 200
 
 
-def _build_toc_section(headings: list[dict]) -> str:
-    """
-    构建目录 HTML 片段（不含 html/head/body 壳）。
-
-    布局：<table> 三列
-      列1 toc-title  60%  标题文字（含 <a href="#hN"> 跳转链接）
-      列2 toc-dots   30%  实心点字符 overflow:hidden 截断，形成虚线效果
-      列3 toc-page   10%  页码右对齐（含 <a href="#hN"> 跳转链接）
-
-    虚线实现说明：
-      不使用 CSS background/border-bottom（在 wkhtmltopdf 打印渲染里不稳定），
-      而是用大量 "·" 字符填充单元格并用 overflow:hidden 截断，
-      在任何版本 wkhtmltopdf 都可靠。
-    """
-    toc_css = """
-<style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  html, body {
-    color: #111;
-    font-family: "SimSun", "宋体", "Microsoft YaHei", sans-serif;
-    font-size: 12pt;
-    background: #fff;
-  }
-  body { padding: 18mm 20mm; }
+def _toc_css() -> str:
+    """返回目录专用 CSS（放在 <head> 里）。"""
+    return """
   h1.toc-heading {
     text-align: center;
     font-size: 18pt;
     font-weight: 700;
     letter-spacing: 0.4em;
-    margin-bottom: 10mm;
+    margin: 0 0 10mm 0;
   }
   table.toc-table {
     width: 100%;
@@ -406,8 +385,6 @@ def _build_toc_section(headings: list[dict]) -> str:
     vertical-align: bottom;
     color: #555;
     padding: 0 2px;
-    /* 让点字符对齐到底部，与标题基线一致 */
-    padding-bottom: 2px;
   }
   td.toc-page {
     width: 10%;
@@ -415,26 +392,29 @@ def _build_toc_section(headings: list[dict]) -> str:
     text-align: right;
     padding-left: 4px;
   }
-  tr.lvl-1 td.toc-title { font-weight: 700; font-size: 12pt; padding-left: 0; }
-  tr.lvl-2 td.toc-title { font-weight: normal; font-size: 11pt; padding-left: 2em; }
+  tr.lvl-1 td.toc-title { font-weight: 700;   font-size: 12pt;   padding-left: 0; }
+  tr.lvl-2 td.toc-title { font-weight: normal; font-size: 11pt;   padding-left: 2em; }
   tr.lvl-3 td.toc-title { font-weight: normal; font-size: 10.5pt; padding-left: 4em; color: #333; }
-  a { color: inherit; text-decoration: none; }
-</style>
 """
 
-    if not headings:
-        return toc_css + "<h1 class='toc-heading'>目&#x3000;&#x3000;录</h1><p style='text-align:center;margin-top:20mm;'>未生成目录条目</p>"
 
-    # 归一化层级
+def _build_toc_rows(headings: list[dict]) -> str:
+    """
+    构建目录表格行 HTML（仅 <tr> 片段，不含 style/table 标签）。
+    style 已提取到 _toc_css()，在 <head> 里统一注入。
+    """
+    if not headings:
+        return "<tr><td colspan='3' style='text-align:center;padding-top:20mm;'>未生成目录条目</td></tr>"
+
     min_level = min(h["level"] for h in headings)
     level_offset = min_level - 1
 
     rows = []
     for h in headings:
         display_level = min(max(1, h["level"] - level_offset), 3)
-        hid = html.escape(h["id"])
+        hid   = html.escape(h["id"])
         title = html.escape(h["title"])
-        page = html.escape(str(h.get("page", "")))
+        page  = html.escape(str(h.get("page", "")))
         rows.append(
             f"<tr class='lvl-{display_level}'>"
             f"<td class='toc-title'><a href='#{hid}'>{title}</a></td>"
@@ -442,14 +422,7 @@ def _build_toc_section(headings: list[dict]) -> str:
             f"<td class='toc-page'><a href='#{hid}'>{page}</a></td>"
             f"</tr>"
         )
-
-    return (
-        toc_css
-        + "<h1 class='toc-heading'>目&#x3000;&#x3000;录</h1>"
-        + "<table class='toc-table'>"
-        + "".join(rows)
-        + "</table>"
-    )
+    return "".join(rows)
 
 
 # ===========================================================================
@@ -543,6 +516,7 @@ def _build_body_sections(output_dir: str, html_files: list[str]) -> tuple[str, l
         raise HTTPException(status_code=500, detail="所有章节处理失败，无法导出 PDF")
 
     base_href = Path(output_dir).resolve().as_uri() + "/"
+    # _BODY_CSS は combined HTML の <head> に一括注入するため、ここでは最小限のスタイルのみ
     body_html = (
         "<!DOCTYPE html><html><head>"
         "<meta charset='utf-8'>"
@@ -557,43 +531,60 @@ def _build_body_sections(output_dir: str, html_files: list[str]) -> tuple[str, l
 
 def _build_combined_html(output_dir: str, headings_with_pages: list[dict], body_sections_html: str) -> str:
     """
-    构建目录+正文合并 HTML（同一个文档，href="#hN" 跳转有效）。
-    body_sections_html 是 _build_body_sections 返回的完整 HTML，
-    此处提取其 <body> 内容并合并到 TOC 之后。
-    """
-    toc_section = _build_toc_section(headings_with_pages)
+    构建目录+正文合并为单一 HTML 文档。
 
-    # 提取正文 body 内容
+    所有 CSS（包括目录样式）统一放在 <head> 内，
+    避免 <style> 出现在 <body> 里被旧版 WebKit 忽略。
+    目录与正文在同一文档内，href="#hN" 天然有效。
+    """
     body_content = _extract_body_content(body_sections_html)
 
     base_href_m = re.search(r"<base href='([^']+)'", body_sections_html)
     base_href = base_href_m.group(1) if base_href_m else ""
 
-    combined_css = """
-<style>
-  /* 目录页样式 */
-  .toc-page-wrapper {
-    padding: 18mm 20mm;
-  }
-  /* 目录与正文之间强制分页 */
-  .toc-body-break {
-    display: block;
-    page-break-before: always;
-    break-before: page;
-    height: 0; margin: 0; padding: 0;
-  }
-</style>
-"""
+    toc_rows = _build_toc_rows(headings_with_pages)
+
+    head_css = "<style>\n" + (
+        "  * { box-sizing: border-box; }\n"
+        "  html, body {\n"
+        "    margin: 0; padding: 0;\n"
+        "    font-family: \"SimSun\", \"宋体\", \"Microsoft YaHei\", sans-serif;\n"
+        "    font-size: 12pt; color: #111; background: #fff;\n"
+        "  }\n"
+        "  a { color: inherit; text-decoration: none; }\n"
+    ) + _toc_css() + (
+        "  p { margin: 8px 0; text-align: justify; text-indent: 2em; }\n"
+        "  h1 { font-size: 16pt; font-weight: bold; margin: 32px 0 14px 0; text-indent: 0 !important; page-break-after: avoid; }\n"
+        "  h2 { font-size: 13pt; font-weight: bold; margin: 20px 0 10px 0; text-indent: 0 !important; page-break-after: avoid; }\n"
+        "  h3 { font-size: 12pt; font-weight: bold; margin: 14px 0 8px 0; text-indent: 0 !important; page-break-after: avoid; }\n"
+        "  .force-center { text-indent: 0 !important; text-align: center !important; display: block !important; width: 100% !important; margin: 10px 0 !important; }\n"
+        "  .caption-text { font-weight: bold; font-size: 11pt; color: #333; display: block; margin: 4px 0; text-indent: 0 !important; text-align: center !important; }\n"
+        "  img { max-width: 90% !important; height: auto !important; display: block; margin: 0 auto; }\n"
+        "  table { width: 100% !important; margin: 12px auto !important; border-collapse: collapse; border: 1.5px solid #333; text-indent: 0 !important; page-break-inside: avoid; }\n"
+        "  td, th { border: 1px solid #555 !important; padding: 6px 10px; text-align: center; }\n"
+        "  th { background: #f0f0f0; }\n"
+        "  .chapter-break { display: block; page-break-before: always; break-before: page; height: 0; margin: 0; padding: 0; }\n"
+        "  .toc-section { padding: 0; }\n"
+        "  .toc-body-sep { display: block; page-break-before: always; break-before: page; height: 0; margin: 0; padding: 0; }\n"
+        "</style>"
+    )
+
+    toc_block = (
+        "<div class='toc-section'>"
+        "<h1 class='toc-heading'>目&#x3000;&#x3000;录</h1>"
+        "<table class='toc-table'>"
+        + toc_rows
+        + "</table></div>"
+    )
 
     return (
         "<!DOCTYPE html><html><head>"
         "<meta charset='utf-8'>"
         + (f"<base href='{base_href}'>" if base_href else "")
-        + combined_css
-        + _BODY_CSS
+        + head_css
         + "</head><body>"
-        + f"<div class='toc-page-wrapper'>{toc_section}</div>"
-        + "<div class='toc-body-break'></div>"
+        + toc_block
+        + "<div class='toc-body-sep'></div>"
         + body_content
         + "</body></html>"
     )
