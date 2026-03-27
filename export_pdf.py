@@ -639,14 +639,18 @@ def _find_wkhtmltopdf_bin() -> str:
 def _run_wkhtmltopdf(
     input_html: str,
     output_pdf: str,
-    options: dict[str, str],
+    options: dict[str, str | None],
     dump_outline: str | None = None,
 ) -> None:
     wkhtmltopdf_bin = _find_wkhtmltopdf_bin()
     cmd = [wkhtmltopdf_bin]
 
     for key, value in options.items():
+        # None means "omit this flag entirely" (used to cancel inherited keys)
+        if value is None:
+            continue
         cmd.append(f"--{key}")
+        # Empty string means "flag only, no argument" (e.g. --quiet, --enable-local-file-access)
         if value != "":
             cmd.append(str(value))
 
@@ -759,12 +763,18 @@ def export_full_project_pdf(project_id: str):
         )
         _write_text(cover_html_path, cover_html)
 
+        # Cover uses zero margins and no footer.
+        # Set footer-* keys to None so _run_wkhtmltopdf skips them entirely;
+        # an empty-string value would emit --footer-center with no argument
+        # and cause wkhtmltopdf to mis-parse all subsequent flags.
         cover_options = {
             **_common_pdf_options(),
             "margin-top": "0mm", "margin-bottom": "0mm",
             "margin-left": "0mm", "margin-right": "0mm",
-            "no-footer-line": "",
-            "footer-center": "",
+            "footer-center": None,
+            "footer-font-name": None,
+            "footer-font-size": None,
+            "footer-spacing": None,
         }
         _run_wkhtmltopdf(cover_html_path, cover_pdf_path, cover_options)
 
