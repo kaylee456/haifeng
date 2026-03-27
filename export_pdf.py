@@ -360,41 +360,45 @@ def _toc_css() -> str:
     letter-spacing: 0.4em;
     margin: 0 0 10mm 0;
   }
+  /* !important 覆盖正文全局 table/td border 规则，确保目录表格无框线 */
   table.toc-table {
-    width: 100%;
-    border-collapse: collapse;
-    border: none;
-    table-layout: fixed;
+    width: 100% !important;
+    border-collapse: collapse !important;
+    border: none !important;
+    table-layout: fixed !important;
+    margin: 0 !important;
   }
   table.toc-table td {
-    border: none;
-    padding: 2px 0;
-    vertical-align: bottom;
-    line-height: 2;
+    border: none !important;
+    padding: 2px 0 !important;
+    vertical-align: bottom !important;
+    line-height: 2 !important;
+    text-align: left !important;
+    background: transparent !important;
   }
   td.toc-title {
     width: 60%;
     white-space: normal;
     word-break: normal;
-    padding-right: 4px;
+    padding-right: 4px !important;
   }
   td.toc-dots {
     width: 30%;
     overflow: hidden;
     white-space: nowrap;
-    vertical-align: bottom;
+    vertical-align: bottom !important;
     color: #555;
-    padding: 0 2px;
+    padding: 0 2px !important;
   }
   td.toc-page {
     width: 10%;
     white-space: nowrap;
-    text-align: right;
-    padding-left: 4px;
+    text-align: right !important;
+    padding-left: 4px !important;
   }
-  tr.lvl-1 td.toc-title { font-weight: 700;   font-size: 12pt;   padding-left: 0; }
-  tr.lvl-2 td.toc-title { font-weight: normal; font-size: 11pt;   padding-left: 2em; }
-  tr.lvl-3 td.toc-title { font-weight: normal; font-size: 10.5pt; padding-left: 4em; color: #333; }
+  tr.lvl-1 td.toc-title { font-weight: 700;   font-size: 12pt;   padding-left: 0 !important; }
+  tr.lvl-2 td.toc-title { font-weight: normal; font-size: 11pt;   padding-left: 2em !important; }
+  tr.lvl-3 td.toc-title { font-weight: normal; font-size: 10.5pt; padding-left: 4em !important; color: #333; }
 """
 
 
@@ -412,14 +416,13 @@ def _build_toc_rows(headings: list[dict]) -> str:
     rows = []
     for h in headings:
         display_level = min(max(1, h["level"] - level_offset), 3)
-        hid   = html.escape(h["id"])
         title = html.escape(h["title"])
         page  = html.escape(str(h.get("page", "")))
         rows.append(
             f"<tr class='lvl-{display_level}'>"
-            f"<td class='toc-title'><a href='#{hid}'>{title}</a></td>"
+            f"<td class='toc-title'>{title}</td>"
             f"<td class='toc-dots'>{_DOTS}</td>"
-            f"<td class='toc-page'><a href='#{hid}'>{page}</a></td>"
+            f"<td class='toc-page'>{page}</td>"
             f"</tr>"
         )
     return "".join(rows)
