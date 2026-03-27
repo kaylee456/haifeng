@@ -792,7 +792,7 @@ def export_full_project_pdf(project_id: str):
         content_options = {
             **_common_pdf_options(),
             "margin-top": "25mm", "margin-bottom": "20mm",
-            "margin-left": "30mm", "margin-right": "20mm",
+            "margin-left": "35mm", "margin-right": "25mm",
         }
 
         # ── Step 2: 渲染正文（仅用于 dump-outline 获取页码）────────────
