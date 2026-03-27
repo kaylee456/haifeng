@@ -482,11 +482,11 @@ _BODY_CSS = """
   body {
     font-family: "SimSun", "宋体", "Microsoft YaHei", sans-serif;
     font-size: 12pt;
-    line-height: 1.8;
+    line-height: 1.8 !important;
     color: #111;
     padding: 0 24px;
   }
-  p { margin: 24px 0; text-align: justify; text-indent: 2em; }
+  p { margin: 24px 0 !important; line-height: 1.8 !important; text-align: justify; text-indent: 2em; }
   h1 { font-size: 18pt; font-weight: bold; margin: 36px 0 16px 0; text-indent: 0 !important; page-break-after: avoid; }
   h2 { font-size: 15pt; font-weight: bold; margin: 24px 0 12px 0; text-indent: 0 !important; page-break-after: avoid; }
   h3 { font-size: 13pt; font-weight: bold; margin: 16px 0 8px 0; text-indent: 0 !important; page-break-after: avoid; }
@@ -597,7 +597,7 @@ def _build_combined_html(output_dir: str, headings_with_pages: list[dict], body_
         "  }\n"
         "  a { color: inherit; text-decoration: none; }\n"
     ) + _toc_css() + (
-        "  p { margin: 24px 0; text-align: justify; text-indent: 2em; }\n"
+        "  p { margin: 24px 0 !important; line-height: 1.8 !important; text-align: justify; text-indent: 2em; }\n"
         "  h1 { font-size: 18pt; font-weight: bold; margin: 36px 0 16px 0; text-indent: 0 !important; page-break-after: avoid; }\n"
         "  h2 { font-size: 15pt; font-weight: bold; margin: 24px 0 12px 0; text-indent: 0 !important; page-break-after: avoid; }\n"
         "  h3 { font-size: 13pt; font-weight: bold; margin: 16px 0 8px 0; text-indent: 0 !important; page-break-after: avoid; }\n"
