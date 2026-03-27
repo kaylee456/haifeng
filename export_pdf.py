@@ -314,32 +314,34 @@ def _build_cover_html(project_name: str, cover_image_uri: str,
 # dump-outline 解析（仅用于获取页码）
 # ===========================================================================
 
-def _parse_outline_pages(xml_path: str) -> list[int]:
+def _parse_outline_items(xml_path: str) -> list[dict]:
     """
-    解析 wkhtmltopdf dump-outline XML，按深度优先顺序返回所有标题的页码列表。
-    顺序与正文中 h1/h2/h3 出现顺序一致。
+    解析 wkhtmltopdf dump-outline XML，返回 {title, page, level} 列表。
+    level 由 XML 中的嵌套深度决定，是唯一可靠的层级来源——
+    与文件名 depth 或 h 标签序号无关。
+    从根的直接子节点出发（level=1），深度优先遍历。
     """
     if not os.path.exists(xml_path):
         return []
 
     tree = ET.parse(xml_path)
     root = tree.getroot()
+    items: list[dict] = []
 
-    pages: list[int] = []
-
-    def walk(node):
+    def walk(node, level: int) -> None:
         for child in node.findall("outline:item", _OUTLINE_NS):
             title = (child.attrib.get("title") or "").strip()
             page_str = (child.attrib.get("page") or "0").strip()
             if title:
                 try:
-                    pages.append(int(page_str))
+                    page = int(page_str)
                 except ValueError:
-                    pages.append(0)
-            walk(child)
+                    page = 0
+                items.append({"title": title, "page": page, "level": level})
+            walk(child, level + 1)
 
-    walk(root)
-    return pages
+    walk(root, 1)
+    return items
 
 
 # ===========================================================================
@@ -746,14 +748,13 @@ def export_full_project_pdf(project_id: str):
         }
         _run_wkhtmltopdf(body_html_path, body_pdf_path, body_options, dump_outline=outline_xml_path)
 
-        # ── Step 3: 将 dump-outline 页码写入 headings ─────────────────
-        outline_pages = _parse_outline_pages(outline_xml_path)
-        # 按顺序匹配：outline 条目顺序 = 正文中标题出现顺序
-        for i, h in enumerate(all_headings):
-            h["page"] = outline_pages[i] if i < len(outline_pages) else ""
+        # ── Step 3: 从 dump-outline 获取层级+页码（以 XML 嵌套为准）──
+        # outline XML 的嵌套层级 = wkhtmltopdf 实际解析到的 h1/h2/h3 层级，
+        # 是目录层级的唯一可靠来源，与文件名 depth 无关。
+        toc_headings = _parse_outline_items(outline_xml_path)
 
-        # ── Step 4: 构建目录+正文合并 HTML，一次渲染保证跳转链接有效 ──
-        combined_html = _build_combined_html(output_dir, all_headings, body_html)
+        # ── Step 4: 构建目录+正文合并 HTML ─────────────────────────────
+        combined_html = _build_combined_html(output_dir, toc_headings, body_html)
         _write_text(combined_html_path, combined_html)
 
         combined_options = {
