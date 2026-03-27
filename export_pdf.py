@@ -12,8 +12,8 @@ PDF 全量导出模块
   Step 3. 合并封面 PDF + 目录+正文 PDF
 
 虚线：用 Unicode 全角点字符（·）重复填满行，父容器 overflow:hidden 截断，
-      float:right 页码 + overflow:hidden 父容器确保点字符紧接标题文字，
-      无任何空白间隔，任何版本 wkhtmltopdf 均可靠渲染。
+      页码用 position:absolute; right:0; background:#fff 叠于最上层，
+      彻底消除点字符与页码重叠，任何版本 wkhtmltopdf 均可靠渲染。
 
 heading-shift：各章节文件按文件名深度对 h1-h6 做层级偏移，使 wkhtmltopdf
                outline 树的层级与文档结构一致，dump-outline 页码准确。
@@ -357,13 +357,16 @@ def _toc_css() -> str:
     """
     目录专用 CSS。
 
-    虚线布局原理（float + overflow）：
-      1. 页码 span 设置 float:right，在 HTML 中排在最前面
-      2. 标题文字 span + 点字符 span 在普通流中紧随其后
-      3. 父 div 设置 overflow:hidden + white-space:nowrap
+    虚线布局原理（position:absolute 页码 + padding-right 占位）：
+      1. 父 div 设置 position:relative; overflow:hidden; white-space:nowrap
+      2. 页码 span 设置 position:absolute; right:0; background:#fff
+         使页码文字叠在最上层并用白底遮住下方溢出的点字符
+      3. 父 div 设置 padding-right 留出与页码等宽的空间，
+         使点字符自然在页码左侧截断（依赖父级 overflow:hidden）
 
-    这样点字符从标题文字末尾开始，一直延伸到被 float 边界截断为止，
-    与标题文字之间没有任何空白，在所有版本 wkhtmltopdf 中均可靠渲染。
+    这样点字符从标题末尾延伸，被 overflow:hidden 截断于行右边界，
+    页码用白底绝对定位叠在最上层，彻底消除重叠问题，
+    在所有版本 wkhtmltopdf 中均可靠渲染。
     """
     return """
   h1.toc-heading {
@@ -375,15 +378,20 @@ def _toc_css() -> str:
   }
   .toc-row {
     display: block;
+    position: relative;
     overflow: hidden;
     white-space: nowrap;
     line-height: 2.2;
     width: 100%;
     font-size: 12pt;
     font-family: "SimSun", "宋体", "Microsoft YaHei", sans-serif;
+    padding-right: 3em;
   }
   .toc-pg {
-    float: right;
+    position: absolute;
+    right: 0;
+    top: 0;
+    background: #fff;
     padding-left: 6px;
     font-weight: normal;
   }
@@ -423,15 +431,14 @@ def _build_toc_entries(headings: list[dict]) -> str:
     """
     构建目录条目 HTML。
 
-    每行结构（float + overflow 虚线方案）：
+    每行结构（position:absolute 页码 + padding-right 占位）：
       <div class="toc-row lvl-N">
-        <span class="toc-pg">页码</span>         <!-- float:right，HTML 排最前 -->
         [缩进空格]<span class="toc-ti">标题</span><span class="toc-dots">···</span>
+        <span class="toc-pg">页码</span>   <!-- position:absolute; right:0; background:#fff -->
       </div>
 
-    float:right 页码先渲染占据右侧，剩余宽度由标题+点字符填满，
-    overflow:hidden+white-space:nowrap 在 float 边界处截断点字符，
-    点字符紧接标题末尾，无任何多余间距。
+    父 div padding-right:3em 为页码预留空间，overflow:hidden 截断超出行宽的点字符，
+    页码用白底绝对定位叠于最上层，彻底消除点字符与页码重叠问题。
 
     缩进使用全角空格 &#x3000;（宽度 = 1em），可靠渲染于所有 WebKit 版本：
       lvl-1：无缩进
@@ -450,12 +457,11 @@ def _build_toc_entries(headings: list[dict]) -> str:
         page_escaped  = html.escape(str(h.get("page", "")))
         indent_html   = _INDENT.get(display_level, "")
 
-        # 页码 span 必须在 HTML 里排第一，才能正确 float:right
         rows.append(
             f'<div class="toc-row lvl-{display_level}">'
-            f'<span class="toc-pg">{page_escaped}</span>'
             f'{indent_html}<span class="toc-ti">{title_escaped}</span>'
             f'<span class="toc-dots">{_DOTS}</span>'
+            f'<span class="toc-pg">{page_escaped}</span>'
             f'</div>'
         )
 
