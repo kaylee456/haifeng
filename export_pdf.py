@@ -482,7 +482,7 @@ _BODY_CSS = """
   body {
     font-family: "SimSun", "宋体", "Microsoft YaHei", sans-serif;
     font-size: 12pt;
-    line-height: 1.5;
+    line-height: 1.8;
     color: #111;
     padding: 0 24px;
   }
