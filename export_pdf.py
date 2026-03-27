@@ -25,7 +25,6 @@ outline 层级策略（heading-shift）：
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse, unquote
-from xml.etree import ElementTree as ET
 import html
 import html as html_module
 import json
@@ -46,7 +45,6 @@ except ImportError:  # pragma: no cover - runtime fallback
 _LEGACY_ROOT = "/home/public/haifeng/develop_git_merge"
 _DEPLOY_ROOT = "/opt/AIHaiFeng_task6/develop"
 _DEFAULT_WKHTMLTOPDF = "/usr/local/bin/wkhtmltopdf"
-_OUTLINE_NS = {"outline": "http://wkhtmltopdf.org/outline"}
 
 router = APIRouter()
 try:
@@ -382,147 +380,153 @@ def _build_cover_html(
     return _html_shell("封面", body_html, cover_css)
 
 
-def _parse_outline_items(xml_path: str) -> list[dict]:
+def _write_toc_xsl(xsl_path: str) -> None:
     """
-    解析 wkhtmltopdf dump-outline 生成的 XML，返回扁平化的目录条目列表。
-    从 outline 根的直接子节点出发，逐级递归，level 从 1 起算。
-    同时收集 link 属性，供目录条目生成可点击跳转链接。
+    生成供 wkhtmltopdf 原生 toc 子命令使用的 XSL 样式表。
+
+    为什么用 toc 子命令而不是独立渲染 TOC HTML 再合并：
+    1. 独立渲染的 TOC PDF 里 href="#anchor" 锚点跳转在合并后无效，
+       因为目标锚点在另一个 PDF 文件里。
+    2. CSS background-image/radial-gradient 在独立 HTML 打印渲染时
+       需要 -webkit-print-color-adjust:exact 才能输出，容易被遗漏。
+    toc 子命令在同一次渲染里生成目录+正文，wkhtmltopdf 自动建立
+    真正的 PDF 内部跳转链接，border-bottom:dotted 也完全可靠。
+
+    遍历策略（避免重复）：
+    - 根模板仅 select outline:item/outline:item（根节点的直接子项）
+    - 每级模板渲染自身后递归下一级的直接子节点
+    - 切勿使用 //outline:item（会导致每个条目被多次渲染）
     """
-    if not os.path.exists(xml_path):
-        return []
+    xsl = r"""<?xml version="1.0" encoding="UTF-8"?>
+<xsl:stylesheet version="1.0"
+    xmlns:xsl="http://www.w3.org/1999/XSL/Transform"
+    xmlns:outline="http://wkhtmltopdf.org/outline"
+    xmlns="http://www.w3.org/1999/xhtml">
+  <xsl:output method="html" encoding="UTF-8" indent="no"/>
 
-    tree = ET.parse(xml_path)
-    root = tree.getroot()
+  <xsl:template match="outline:outline">
+    <html>
+      <head>
+        <meta charset="utf-8"/>
+        <style>
+          * { box-sizing: border-box; margin: 0; padding: 0; }
+          body {
+            font-family: "SimSun", "&#23435;&#20307;", "Microsoft YaHei", serif;
+            font-size: 12pt;
+            color: #000;
+            padding: 2cm 2.5cm;
+            line-height: 1.8;
+          }
+          h1.toc-heading {
+            text-align: center;
+            font-size: 16pt;
+            font-weight: bold;
+            letter-spacing: 6px;
+            margin-bottom: 20px;
+          }
+          table.toc-table {
+            width: 100%;
+            border-collapse: collapse;
+            border: none;
+            table-layout: fixed;
+          }
+          table.toc-table td {
+            border: none;
+            padding: 2px 0;
+            vertical-align: bottom;
+            line-height: 2;
+          }
+          td.toc-title {
+            width: 60%;
+            white-space: normal;
+            word-break: normal;
+            padding-right: 4px;
+          }
+          td.toc-dots {
+            width: 30%;
+            border-bottom: 1px dotted #555;
+          }
+          td.toc-page {
+            width: 10%;
+            white-space: nowrap;
+            text-align: right;
+            padding-left: 4px;
+          }
+          tr.l1 td.toc-title { font-weight: bold;   font-size: 12pt;   padding-left: 0; }
+          tr.l2 td.toc-title { font-weight: normal;  font-size: 11pt;   padding-left: 2em; }
+          tr.l3 td.toc-title { font-weight: normal;  font-size: 10.5pt; padding-left: 4em; color: #333; }
+          a { color: inherit; text-decoration: none; }
+        </style>
+      </head>
+      <body>
+        <h1 class="toc-heading">&#x76EE;&#x3000;&#x3000;&#x5F55;</h1>
+        <table class="toc-table">
+          <xsl:apply-templates select="outline:item/outline:item" mode="l1"/>
+        </table>
+      </body>
+    </html>
+  </xsl:template>
 
-    def walk(node, level: int) -> list[dict]:
-        items: list[dict] = []
-        for child in node.findall("outline:item", _OUTLINE_NS):
-            title = (child.attrib.get("title") or "").strip()
-            page  = (child.attrib.get("page")  or "").strip()
-            link  = (child.attrib.get("link")  or "").strip()
-            if title:
-                items.append({"title": title, "page": page, "link": link, "level": level})
-            items.extend(walk(child, level + 1))
-        return items
+  <xsl:template match="outline:item" mode="l1">
+    <xsl:if test="normalize-space(@title) != ''">
+      <tr class="l1">
+        <td class="toc-title">
+          <a><xsl:attribute name="href"><xsl:value-of select="@link"/></xsl:attribute>
+            <xsl:value-of select="@title"/>
+          </a>
+        </td>
+        <td class="toc-dots"></td>
+        <td class="toc-page">
+          <a><xsl:attribute name="href"><xsl:value-of select="@link"/></xsl:attribute>
+            <xsl:value-of select="@page"/>
+          </a>
+        </td>
+      </tr>
+      <xsl:apply-templates select="outline:item" mode="l2"/>
+    </xsl:if>
+  </xsl:template>
 
-    return walk(root, 1)
+  <xsl:template match="outline:item" mode="l2">
+    <xsl:if test="normalize-space(@title) != ''">
+      <tr class="l2">
+        <td class="toc-title">
+          <a><xsl:attribute name="href"><xsl:value-of select="@link"/></xsl:attribute>
+            <xsl:value-of select="@title"/>
+          </a>
+        </td>
+        <td class="toc-dots"></td>
+        <td class="toc-page">
+          <a><xsl:attribute name="href"><xsl:value-of select="@link"/></xsl:attribute>
+            <xsl:value-of select="@page"/>
+          </a>
+        </td>
+      </tr>
+      <xsl:apply-templates select="outline:item" mode="l3"/>
+    </xsl:if>
+  </xsl:template>
 
+  <xsl:template match="outline:item" mode="l3">
+    <xsl:if test="normalize-space(@title) != ''">
+      <tr class="l3">
+        <td class="toc-title">
+          <a><xsl:attribute name="href"><xsl:value-of select="@link"/></xsl:attribute>
+            <xsl:value-of select="@title"/>
+          </a>
+        </td>
+        <td class="toc-dots"></td>
+        <td class="toc-page">
+          <a><xsl:attribute name="href"><xsl:value-of select="@link"/></xsl:attribute>
+            <xsl:value-of select="@page"/>
+          </a>
+        </td>
+      </tr>
+    </xsl:if>
+  </xsl:template>
 
-def _build_toc_html(items: list[dict]) -> str:
-    """
-    构建目录 HTML。
-
-    布局采用真实 <table> 三列（标题 | 虚线 | 页码），
-    避免旧版 wkhtmltopdf WebKit 对 flex/display:table-cell 的兼容问题。
-    虚线列用 background-image radial-gradient 实现；
-    页码列包裹在 <a href="link"> 中实现点击跳转。
-    """
-    toc_css = """
-<style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  html, body {
-    color: #111;
-    font-family: "SimSun", "宋体", "Microsoft YaHei", sans-serif;
-    font-size: 12pt;
-    background: #fff;
-  }
-  body {
-    padding: 18mm 20mm;
-  }
-  h1.toc-heading {
-    text-align: center;
-    font-size: 18pt;
-    font-weight: 700;
-    letter-spacing: 0.4em;
-    margin-bottom: 10mm;
-  }
-  table.toc-table {
-    width: 100%;
-    border-collapse: collapse;
-    border: none;
-    table-layout: fixed;
-  }
-  table.toc-table td {
-    border: none;
-    padding: 3px 0;
-    vertical-align: bottom;
-    line-height: 1.9;
-  }
-  /* 标题列：固定宽度，不换行防止挤压虚线列 */
-  td.toc-title {
-    width: 60%;
-    white-space: normal;
-    word-break: normal;
-    padding-right: 4px;
-  }
-  /* 虚线列：剩余宽度，用 radial-gradient 画圆点 */
-  td.toc-dots {
-    width: 30%;
-    border-bottom: none;
-    background-image: radial-gradient(circle, #555 1px, transparent 1px);
-    background-size: 6px 1px;
-    background-repeat: repeat-x;
-    background-position: 0 bottom;
-  }
-  /* 页码列：固定宽度，右对齐 */
-  td.toc-page {
-    width: 10%;
-    white-space: nowrap;
-    text-align: right;
-    padding-left: 4px;
-  }
-  /* 层级缩进与字重 */
-  tr.lvl-1 td.toc-title { font-weight: 700; font-size: 12pt; padding-left: 0; }
-  tr.lvl-2 td.toc-title { font-weight: normal; font-size: 11pt; padding-left: 2em; }
-  tr.lvl-3 td.toc-title { font-weight: normal; font-size: 10.5pt; padding-left: 4em; color: #222; }
-  /* 跳转链接样式：颜色与正文一致，不显示下划线 */
-  a.toc-link { color: inherit; text-decoration: none; }
-  a.toc-link:hover { text-decoration: underline; }
-</style>
+</xsl:stylesheet>
 """
-
-    if not items:
-        body_html = (
-            "<h1 class='toc-heading'>目&#x3000;&#x3000;录</h1>"
-            "<p style='text-align:center;margin-top:20mm;'>未生成目录条目</p>"
-        )
-        return _html_shell("目录", body_html, toc_css)
-
-    # 归一化：让实际最小层级映射到 lvl-1
-    min_level = min(int(item["level"]) for item in items)
-    level_offset = min_level - 1
-
-    rows = []
-    for item in items:
-        display_level = min(max(1, int(item["level"]) - level_offset), 3)
-        title_escaped = html.escape(str(item["title"]))
-        page_escaped  = html.escape(str(item["page"]))
-        link = str(item.get("link") or "").strip()
-
-        # 标题列内容
-        title_cell = title_escaped
-
-        # 页码列：有跳转链接则包裹 <a>
-        if link:
-            page_cell = f'<a class="toc-link" href="{html.escape(link)}">{page_escaped}</a>'
-        else:
-            page_cell = page_escaped
-
-        rows.append(
-            f"<tr class='lvl-{display_level}'>"
-            f"<td class='toc-title'>{title_cell}</td>"
-            f"<td class='toc-dots'></td>"
-            f"<td class='toc-page'>{page_cell}</td>"
-            f"</tr>"
-        )
-
-    body_html = (
-        "<h1 class='toc-heading'>目&#x3000;&#x3000;录</h1>"
-        "<table class='toc-table'>"
-        + "".join(rows)
-        + "</table>"
-    )
-    return _html_shell("目录", body_html, toc_css)
+    with open(xsl_path, "w", encoding="utf-8") as fh:
+        fh.write(xsl)
 
 
 def _write_text(path: str, content: str) -> None:
@@ -542,8 +546,16 @@ def _run_wkhtmltopdf(
     input_html: str,
     output_pdf: str,
     options: dict[str, str],
-    dump_outline: str | None = None,
+    toc_xsl: str | None = None,
 ) -> None:
+    """
+    调用 wkhtmltopdf 将 HTML 转为 PDF。
+
+    若传入 toc_xsl，则在全局选项之后、正文 input_html 之前
+    插入 toc 子命令，使 wkhtmltopdf 在同一次渲染里生成目录：
+        wkhtmltopdf [global-options] toc --xsl-style-sheet <xsl> <html> <pdf>
+    这样目录中的链接是真正的 PDF 内部跳转，虚线也在同一渲染里输出。
+    """
     wkhtmltopdf_bin = _find_wkhtmltopdf_bin()
     cmd = [wkhtmltopdf_bin]
 
@@ -552,8 +564,8 @@ def _run_wkhtmltopdf(
         if value != "":
             cmd.append(str(value))
 
-    if dump_outline:
-        cmd.extend(["--dump-outline", dump_outline])
+    if toc_xsl:
+        cmd.extend(["toc", "--xsl-style-sheet", toc_xsl])
 
     cmd.extend([input_html, output_pdf])
 
@@ -784,22 +796,18 @@ def export_full_project_pdf(project_id: str):
     date_text = _current_year_month()
 
     cover_html_path = os.path.join(project_export_dir, f"cover_{ts}.html")
-    toc_html_path = os.path.join(project_export_dir, f"toc_{ts}.html")
-    body_html_path = os.path.join(project_export_dir, f"body_{ts}.html")
-    outline_xml_path = os.path.join(project_export_dir, f"outline_{ts}.xml")
+    body_html_path  = os.path.join(project_export_dir, f"body_{ts}.html")
+    toc_xsl_path    = os.path.join(project_export_dir, f"toc_{ts}.xsl")
 
-    cover_pdf_path = os.path.join(project_export_dir, f"cover_{ts}.pdf")
-    toc_pdf_path = os.path.join(project_export_dir, f"toc_{ts}.pdf")
-    body_pdf_path = os.path.join(project_export_dir, f"body_{ts}.pdf")
+    cover_pdf_path  = os.path.join(project_export_dir, f"cover_{ts}.pdf")
+    body_toc_pdf_path = os.path.join(project_export_dir, f"body_toc_{ts}.pdf")
 
     temp_files = [
         cover_html_path,
-        toc_html_path,
         body_html_path,
-        outline_xml_path,
+        toc_xsl_path,
         cover_pdf_path,
-        toc_pdf_path,
-        body_pdf_path,
+        body_toc_pdf_path,
     ]
 
     try:
@@ -813,6 +821,7 @@ def export_full_project_pdf(project_id: str):
 
         _write_text(cover_html_path, cover_html)
         _write_text(body_html_path, body_html)
+        _write_toc_xsl(toc_xsl_path)
 
         cover_options = {
             **_common_pdf_options(),
@@ -821,13 +830,9 @@ def export_full_project_pdf(project_id: str):
             "margin-left": "10mm",
             "margin-right": "10mm",
         }
-        toc_options = {
-            **_common_pdf_options(),
-            "margin-top": "16mm",
-            "margin-bottom": "18mm",
-            "margin-left": "20mm",
-            "margin-right": "20mm",
-        }
+        # 正文 + 目录在同一次渲染里完成：
+        #   wkhtmltopdf [options] toc --xsl-style-sheet toc.xsl body.html output.pdf
+        # 这样 wkhtmltopdf 自动建立真正的 PDF 内部跳转链接，虚线在同一渲染里输出
         body_options = {
             **_common_pdf_options(),
             "margin-top": "18mm",
@@ -837,14 +842,9 @@ def export_full_project_pdf(project_id: str):
         }
 
         _run_wkhtmltopdf(cover_html_path, cover_pdf_path, cover_options)
-        _run_wkhtmltopdf(body_html_path, body_pdf_path, body_options, dump_outline=outline_xml_path)
+        _run_wkhtmltopdf(body_html_path, body_toc_pdf_path, body_options, toc_xsl=toc_xsl_path)
 
-        toc_items = _parse_outline_items(outline_xml_path)
-        toc_html = _build_toc_html(toc_items)
-        _write_text(toc_html_path, toc_html)
-        _run_wkhtmltopdf(toc_html_path, toc_pdf_path, toc_options)
-
-        _merge_pdfs(final_pdf, [cover_pdf_path, toc_pdf_path, body_pdf_path])
+        _merge_pdfs(final_pdf, [cover_pdf_path, body_toc_pdf_path])
         return FileResponse(final_pdf, filename=final_name, media_type="application/pdf")
     finally:
         for path in temp_files:
