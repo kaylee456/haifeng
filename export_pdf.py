@@ -3,28 +3,25 @@ PDF 全量导出模块
 ================
 生成带封面、目录、正文的完整项目 PDF。
 
-目录生成流程：
-1. 将正文渲染为 PDF 并 dump-outline（wkhtmltopdf 生成 XML）
-2. 解析 outline XML，构建目录 HTML
-3. 分别渲染封面、目录、正文 PDF，最后合并
+架构（两步渲染）：
+  Step 1. 单独渲染正文 HTML → 正文 PDF + dump-outline XML
+          从 XML 获取每个标题的真实页码
+  Step 2. 将 TOC（含正确页码和 href="#hN" 跳转链接）与正文合并为
+          一个 HTML，一次渲染 → 目录+正文 PDF
+          同一次渲染内 href="#hN" 天然有效，wkhtmltopdf 自动建立 PDF 内部链接
+  Step 3. 合并封面 PDF + 目录+正文 PDF
 
-outline 层级策略（heading-shift）：
-  wkhtmltopdf 以页面内所有 <h1>-<h6> 为节点构建 outline。
-  各章节文件的深度由文件名决定：
-    Chapter1_result.html     -> depth=1（顶层章）
-    Chapter1-2_result.html   -> depth=2（节）
-    Chapter1-2-1_result.html -> depth=3（子节）
-  合并时对每个文件的标题做 shift = depth-1：
-    depth=1: h1→h1, h2→h2, h3→h3  （不偏移）
-    depth=2: h1→h2, h2→h3, h3→h3  （+1，最大h3）
-    depth=3: h1→h3, h2→h3, h3→h3  （+2，最大h3）
-  这样合并后所有标题的层级直接反映文档结构，
-  wkhtmltopdf 自然生成正确的嵌套 outline，无需注入或隐藏任何元素。
+虚线：用 Unicode 全角点字符（·）重复填满 td，CSS overflow:hidden 截断，
+      无 CSS 兼容性问题，任何版本 wkhtmltopdf 均可靠渲染。
+
+heading-shift：各章节文件按文件名深度对 h1-h6 做层级偏移，使 wkhtmltopdf
+               outline 树的层级与文档结构一致，dump-outline 页码准确。
 """
 
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse, unquote
+from xml.etree import ElementTree as ET
 import html
 import html as html_module
 import json
@@ -38,13 +35,14 @@ from fastapi.responses import FileResponse
 
 try:
     from pypdf import PdfReader, PdfWriter
-except ImportError:  # pragma: no cover - runtime fallback
+except ImportError:  # pragma: no cover
     from PyPDF2 import PdfReader, PdfWriter
 
 
 _LEGACY_ROOT = "/home/public/haifeng/develop_git_merge"
 _DEPLOY_ROOT = "/opt/AIHaiFeng_task6/develop"
 _DEFAULT_WKHTMLTOPDF = "/usr/local/bin/wkhtmltopdf"
+_OUTLINE_NS = {"outline": "http://wkhtmltopdf.org/outline"}
 
 router = APIRouter()
 try:
@@ -62,13 +60,11 @@ def natural_sort_key(s: str) -> list:
 
 
 def _extract_body_content(html_text: str) -> str:
-    """提取 <body> 内的片段，丢弃 <head>/<html> 壳。"""
     m = re.search(r"<body[^>]*>(.*?)</body>", html_text, flags=re.IGNORECASE | re.DOTALL)
     return m.group(1) if m else html_text
 
 
 def _strip_inner_page_breaks(html_text: str) -> str:
-    """删除章节 HTML 自带的强制分页指令，避免与合并后的分页冲突。"""
     html_text = re.sub(r"<style[^>]*>.*?</style>", "", html_text, flags=re.IGNORECASE | re.DOTALL)
     html_text = re.sub(r"<script[^>]*>.*?</script>", "", html_text, flags=re.IGNORECASE | re.DOTALL)
     html_text = re.sub(r"page-break-before\s*:\s*always\s*;?", "", html_text, flags=re.IGNORECASE)
@@ -80,12 +76,8 @@ def _strip_inner_page_breaks(html_text: str) -> str:
 
 def _shift_headings(html_text: str, shift: int) -> str:
     """
-    将内容里的 <h1>-<h6> 统一向下偏移 shift 级，上限为 <h3>。
-
-    例：shift=1 时 h1→h2, h2→h3, h3→h3；
-        shift=2 时 h1→h3, h2→h3, h3→h3。
-
-    shift=0 时不做任何替换，直接返回原文。
+    将内容里的 h1-h6 向下偏移 shift 级（上限 h3）。
+    shift=0 时不处理，直接返回。
     """
     if shift <= 0:
         return html_text
@@ -93,7 +85,7 @@ def _shift_headings(html_text: str, shift: int) -> str:
     def replace_tag(m: re.Match) -> str:
         orig_level = int(m.group(1))
         new_level = min(orig_level + shift, 3)
-        attrs = m.group(2)      # 原标签属性（含空格前缀）
+        attrs = m.group(2)
         inner = m.group(3)
         return f"<h{new_level}{attrs}>{inner}</h{new_level}>"
 
@@ -105,23 +97,41 @@ def _shift_headings(html_text: str, shift: int) -> str:
     )
 
 
+def _inject_heading_ids(html_text: str, counter: list) -> tuple[str, list[dict]]:
+    """
+    给 h1/h2/h3 注入 id="hN"，同时收集标题信息。
+    返回 (modified_html, [{'id','title','level'}, ...])
+    """
+    headings: list[dict] = []
+
+    def repl(m: re.Match) -> str:
+        num = m.group(1)
+        attrs = m.group(2)
+        inner = m.group(3)
+        hid = f"h{counter[0]}"
+        counter[0] += 1
+        title = re.sub(r"<[^>]+>", "", inner).strip()
+        title = re.sub(r"\s+", " ", title)
+        headings.append({"id": hid, "title": title, "level": int(num)})
+        if not re.search(r"\bid\s*=", attrs, re.IGNORECASE):
+            attrs = f' id="{hid}"' + attrs
+        return f"<h{num}{attrs}>{inner}</h{num}>"
+
+    result = re.sub(
+        r"<h([1-3])((?:\s[^>]*)?)\s*>(.*?)</h[1-3]\s*>",
+        repl,
+        html_text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    return result, headings
+
+
 def _top_chapter_key(fname: str) -> str:
-    """
-    提取顶层章号，用于检测章间切换以插入分页。
-    Chapter10-2-1_result.html -> "Chapter10"
-    Chapter10_result.html -> "Chapter10"
-    """
     m = re.match(r"^(Chapter\d+)(?:-|_result\.html)", fname)
     return m.group(1) if m else "UNKNOWN"
 
 
 def _determine_depth(fname: str) -> int:
-    """
-    根据文件名中连字符数量判断深度（1-based）：
-    Chapter10_result.html    -> 1
-    Chapter10-2_result.html  -> 2
-    Chapter10-2-1_result.html -> 3
-    """
     base = fname.replace("_result.html", "")
     return min(len(base.split("-")), 3)
 
@@ -148,8 +158,6 @@ def _resolve_existing_path(*raw_paths: str) -> str | None:
 
 
 def _normalize_src_href_to_file_uri(html_text: str, base_dir: str) -> str:
-    """将相对路径与本机绝对路径统一转换为 file:// URI。"""
-
     def repl(m):
         attr, url = m.group(1), m.group(2).strip()
         if url.startswith(("http://", "https://", "file://", "data:", "#", "mailto:", "javascript:")):
@@ -164,7 +172,6 @@ def _normalize_src_href_to_file_uri(html_text: str, base_dir: str) -> str:
 
 
 def _rewrite_spic_urls_to_local_file(html_text: str) -> str:
-    """将内网/生产域名资源链接替换为本地 file:// 路径，找不到则置空。"""
     allowed_hosts = {"aiconstructionplan.spic.com.cn", "172.16.12.1"}
     search_roots = [_DEPLOY_ROOT, _LEGACY_ROOT, str(Path(__file__).resolve().parent)]
 
@@ -176,7 +183,6 @@ def _rewrite_spic_urls_to_local_file(html_text: str) -> str:
         host = (p.hostname or "").lower()
         if host not in allowed_hosts or not p.path.startswith("/agent/"):
             return m.group(0)
-
         rel_path = unquote(p.path.lstrip("/"))
         for root in search_roots:
             abs_path = os.path.join(root, rel_path)
@@ -187,14 +193,7 @@ def _rewrite_spic_urls_to_local_file(html_text: str) -> str:
     return re.sub(r'(src|href)\s*=\s*["\']([^"\']+)["\']', repl, html_text, flags=re.IGNORECASE)
 
 
-def _strip_html_tags(s: str) -> str:
-    s = re.sub(r"<[^>]+>", "", s or "")
-    return re.sub(r"\s+", " ", s).strip()
-
-
 def clean_latex_safe(html_text: str) -> str:
-    """清理 KaTeX 渲染残留，还原纯文本数学符号。"""
-
     def extract_tex(match):
         tex_m = re.search(r"<annotation[^>]*>(.*?)</annotation>", match.group(0), re.DOTALL)
         return tex_m.group(1) if tex_m else ""
@@ -215,10 +214,6 @@ def clean_latex_safe(html_text: str) -> str:
 
 
 def _sanitize_stray_numeric_lines(content: str) -> str:
-    """
-    去除章节体内孤立的纯数字段落（目录残留序号）。
-    匹配：<p> 12 </p> 或 <p> 2.3 </p> 等。
-    """
     return re.sub(r"<p>\s*\d+(\.\d+)?\s*</p>", "", content, flags=re.IGNORECASE)
 
 
@@ -229,7 +224,6 @@ def _read_project_name(project_id: str) -> str:
     )
     if not template_path:
         return f"项目{project_id}"
-
     try:
         with open(template_path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
@@ -245,12 +239,10 @@ def _current_year_month() -> str:
 
 
 def _html_shell(title: str, body_html: str, extra_css: str = "") -> str:
-    """Wrap body_html in a minimal HTML5 shell."""
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>{html_module.escape(title)}</title>
   {extra_css}
 </head>
@@ -260,116 +252,54 @@ def _html_shell(title: str, body_html: str, extra_css: str = "") -> str:
 </html>"""
 
 
-def _build_cover_html(
-    project_name: str,
-    cover_image_uri: str,
-    badge_image_uri: str,
-    date_text: str,
-) -> str:
+# ===========================================================================
+# 封面
+# ===========================================================================
+
+def _build_cover_html(project_name: str, cover_image_uri: str,
+                      badge_image_uri: str, date_text: str) -> str:
     cover_css = """
 <style>
   *, *::before, *::after { box-sizing: border-box; }
-
   html, body {
-    width: 100%;
-    height: 100%;
-    margin: 0;
-    padding: 0;
-    background: #ffffff;
-    color: #111;
+    width: 100%; height: 100%; margin: 0; padding: 0;
+    background: #fff; color: #111;
     font-family: "Microsoft YaHei", "SimSun", "宋体", sans-serif;
   }
-
   .cover-page {
-    min-height: 100vh;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    padding: 3% 5%;
+    min-height: 100vh; display: flex; flex-direction: column;
+    align-items: center; padding: 3% 5%;
   }
-
-  .cover-badge {
-    width: 100%;
-    text-align: left;
-    flex-shrink: 0;
+  .cover-badge { width: 100%; text-align: left; flex-shrink: 0; }
+  .cover-badge img { max-width: 220px; width: 30%; height: auto; display: block; }
+  .cover-title-box, .cover-image-box, .cover-footer-box {
+    width: 100%; max-width: 900px;
   }
-  .cover-badge img {
-    max-width: 220px;
-    width: 30%;
-    height: auto;
-    display: block;
+  .cover-title-box { padding: 3rem 1rem 2rem; text-align: center; }
+  .cover-title-main, .cover-title-sub {
+    font-size: 32px; line-height: 1.8; font-weight: 700;
+    word-break: break-word; margin: 0.5rem 0;
   }
-
-  .cover-title-box,
-  .cover-image-box,
-  .cover-footer-box {
-    width: 100%;
-    max-width: 900px;
-  }
-
-  .cover-title-box {
-    padding: 3rem 1rem 2rem;
-    text-align: center;
-  }
-  .cover-title-main,
-  .cover-title-sub {
-    font-size: 32px;
-    line-height: 1.8;
-    font-weight: 700;
-    word-break: break-word;
-    margin: 0.5rem 0;
-  }
-
-  .cover-image-box {
-    margin-top: 1rem;
-    padding: 1rem;
-    text-align: center;
-  }
-  .cover-image-box img {
-    max-width: 100%;
-    width: 90%;
-    height: auto;
-    display: block;
-    margin: 0 auto;
-  }
-
-  .cover-footer-box {
-    margin-top: auto;
-    width: 100%;
-    text-align: center;
-    padding: 1rem 0;
-  }
-
-  .cover-company {
-    font-size: 20px;
-    font-weight: 700;
-    line-height: 1.8;
-  }
-  .cover-date {
-    margin-top: 0.5rem;
-    font-size: 18px;
-    font-weight: 700;
-    line-height: 1.6;
-  }
+  .cover-image-box { margin-top: 1rem; padding: 1rem; text-align: center; }
+  .cover-image-box img { max-width: 100%; width: 90%; height: auto; display: block; margin: 0 auto; }
+  .cover-footer-box { margin-top: auto; width: 100%; text-align: center; padding: 1rem 0; }
+  .cover-company { font-size: 20px; font-weight: 700; line-height: 1.8; }
+  .cover-date { margin-top: 0.5rem; font-size: 18px; font-weight: 700; line-height: 1.6; }
 </style>
 """
-
     body_html = f"""
 <div class="cover-page">
   <div class="cover-badge">
     <img src="{html_module.escape(badge_image_uri)}" alt="封面角标" />
   </div>
-
   <br><br><br>
   <div class="cover-title-box">
     <div class="cover-title-main">{html_module.escape(project_name)}</div>
     <div class="cover-title-sub">海上工程施工组织总设计</div>
   </div>
-
   <div class="cover-image-box">
     <img src="{html_module.escape(cover_image_uri)}" alt="封面大图" />
   </div>
-
   <br><br><br><br><br><br>
   <div class="cover-footer-box">
     <div class="cover-company">山东电力工程咨询院有限公司</div>
@@ -380,220 +310,151 @@ def _build_cover_html(
     return _html_shell("封面", body_html, cover_css)
 
 
-def _write_toc_xsl(xsl_path: str) -> None:
+# ===========================================================================
+# dump-outline 解析（仅用于获取页码）
+# ===========================================================================
+
+def _parse_outline_pages(xml_path: str) -> list[int]:
     """
-    生成供 wkhtmltopdf 原生 toc 子命令使用的 XSL 样式表。
-
-    为什么用 toc 子命令而不是独立渲染 TOC HTML 再合并：
-    1. 独立渲染的 TOC PDF 里 href="#anchor" 锚点跳转在合并后无效，
-       因为目标锚点在另一个 PDF 文件里。
-    2. CSS background-image/radial-gradient 在独立 HTML 打印渲染时
-       需要 -webkit-print-color-adjust:exact 才能输出，容易被遗漏。
-    toc 子命令在同一次渲染里生成目录+正文，wkhtmltopdf 自动建立
-    真正的 PDF 内部跳转链接，border-bottom:dotted 也完全可靠。
-
-    遍历策略（避免重复）：
-    - 根模板仅 select outline:item/outline:item（根节点的直接子项）
-    - 每级模板渲染自身后递归下一级的直接子节点
-    - 切勿使用 //outline:item（会导致每个条目被多次渲染）
+    解析 wkhtmltopdf dump-outline XML，按深度优先顺序返回所有标题的页码列表。
+    顺序与正文中 h1/h2/h3 出现顺序一致。
     """
-    xsl = r"""<?xml version="1.0" encoding="UTF-8"?>
-<xsl:stylesheet version="1.0"
-    xmlns:xsl="http://www.w3.org/1999/XSL/Transform"
-    xmlns:outline="http://wkhtmltopdf.org/outline">
-  <xsl:output method="html" encoding="UTF-8" indent="no"/>
+    if not os.path.exists(xml_path):
+        return []
 
-  <xsl:template match="outline:outline">
-    <html>
-      <head>
-        <meta charset="utf-8"/>
-        <style>
-          * { box-sizing: border-box; margin: 0; padding: 0; }
-          body {
-            font-family: "SimSun", "&#23435;&#20307;", "Microsoft YaHei", serif;
-            font-size: 12pt;
-            color: #000;
-            padding: 2cm 2.5cm;
-            line-height: 1.8;
-          }
-          h1.toc-heading {
-            text-align: center;
-            font-size: 16pt;
-            font-weight: bold;
-            letter-spacing: 6px;
-            margin-bottom: 20px;
-          }
-          table.toc-table {
-            width: 100%;
-            border-collapse: collapse;
-            border: none;
-            table-layout: fixed;
-          }
-          table.toc-table td {
-            border: none;
-            padding: 2px 0;
-            vertical-align: bottom;
-            line-height: 2;
-          }
-          td.toc-title {
-            width: 60%;
-            white-space: normal;
-            word-break: normal;
-            padding-right: 4px;
-          }
-          td.toc-dots {
-            width: 30%;
-            border-bottom: 1px dotted #555;
-          }
-          td.toc-page {
-            width: 10%;
-            white-space: nowrap;
-            text-align: right;
-            padding-left: 4px;
-          }
-          tr.l1 td.toc-title { font-weight: bold;   font-size: 12pt;   padding-left: 0; }
-          tr.l2 td.toc-title { font-weight: normal;  font-size: 11pt;   padding-left: 2em; }
-          tr.l3 td.toc-title { font-weight: normal;  font-size: 10.5pt; padding-left: 4em; color: #333; }
-          a { color: inherit; text-decoration: none; }
-        </style>
-      </head>
-      <body>
-        <h1 class="toc-heading">&#x76EE;&#x3000;&#x3000;&#x5F55;</h1>
-        <table class="toc-table">
-          <xsl:apply-templates select="outline:item/outline:item" mode="l1"/>
-        </table>
-      </body>
-    </html>
-  </xsl:template>
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
 
-  <xsl:template match="outline:item" mode="l1">
-    <xsl:if test="normalize-space(@title) != ''">
-      <tr class="l1">
-        <td class="toc-title">
-          <a><xsl:attribute name="href"><xsl:value-of select="@link"/></xsl:attribute>
-            <xsl:value-of select="@title"/>
-          </a>
-        </td>
-        <td class="toc-dots"></td>
-        <td class="toc-page">
-          <a><xsl:attribute name="href"><xsl:value-of select="@link"/></xsl:attribute>
-            <xsl:value-of select="@page"/>
-          </a>
-        </td>
-      </tr>
-      <xsl:apply-templates select="outline:item" mode="l2"/>
-    </xsl:if>
-  </xsl:template>
+    pages: list[int] = []
 
-  <xsl:template match="outline:item" mode="l2">
-    <xsl:if test="normalize-space(@title) != ''">
-      <tr class="l2">
-        <td class="toc-title">
-          <a><xsl:attribute name="href"><xsl:value-of select="@link"/></xsl:attribute>
-            <xsl:value-of select="@title"/>
-          </a>
-        </td>
-        <td class="toc-dots"></td>
-        <td class="toc-page">
-          <a><xsl:attribute name="href"><xsl:value-of select="@link"/></xsl:attribute>
-            <xsl:value-of select="@page"/>
-          </a>
-        </td>
-      </tr>
-      <xsl:apply-templates select="outline:item" mode="l3"/>
-    </xsl:if>
-  </xsl:template>
+    def walk(node):
+        for child in node.findall("outline:item", _OUTLINE_NS):
+            title = (child.attrib.get("title") or "").strip()
+            page_str = (child.attrib.get("page") or "0").strip()
+            if title:
+                try:
+                    pages.append(int(page_str))
+                except ValueError:
+                    pages.append(0)
+            walk(child)
 
-  <xsl:template match="outline:item" mode="l3">
-    <xsl:if test="normalize-space(@title) != ''">
-      <tr class="l3">
-        <td class="toc-title">
-          <a><xsl:attribute name="href"><xsl:value-of select="@link"/></xsl:attribute>
-            <xsl:value-of select="@title"/>
-          </a>
-        </td>
-        <td class="toc-dots"></td>
-        <td class="toc-page">
-          <a><xsl:attribute name="href"><xsl:value-of select="@link"/></xsl:attribute>
-            <xsl:value-of select="@page"/>
-          </a>
-        </td>
-      </tr>
-    </xsl:if>
-  </xsl:template>
+    walk(root)
+    return pages
 
-</xsl:stylesheet>
+
+# ===========================================================================
+# 目录 HTML 构建
+# ===========================================================================
+
+# 用于填充虚线的字符串，足够长以填满任何宽度
+_DOTS = "·" * 200
+
+
+def _build_toc_section(headings: list[dict]) -> str:
+    """
+    构建目录 HTML 片段（不含 html/head/body 壳）。
+
+    布局：<table> 三列
+      列1 toc-title  60%  标题文字（含 <a href="#hN"> 跳转链接）
+      列2 toc-dots   30%  实心点字符 overflow:hidden 截断，形成虚线效果
+      列3 toc-page   10%  页码右对齐（含 <a href="#hN"> 跳转链接）
+
+    虚线实现说明：
+      不使用 CSS background/border-bottom（在 wkhtmltopdf 打印渲染里不稳定），
+      而是用大量 "·" 字符填充单元格并用 overflow:hidden 截断，
+      在任何版本 wkhtmltopdf 都可靠。
+    """
+    toc_css = """
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body {
+    color: #111;
+    font-family: "SimSun", "宋体", "Microsoft YaHei", sans-serif;
+    font-size: 12pt;
+    background: #fff;
+  }
+  body { padding: 18mm 20mm; }
+  h1.toc-heading {
+    text-align: center;
+    font-size: 18pt;
+    font-weight: 700;
+    letter-spacing: 0.4em;
+    margin-bottom: 10mm;
+  }
+  table.toc-table {
+    width: 100%;
+    border-collapse: collapse;
+    border: none;
+    table-layout: fixed;
+  }
+  table.toc-table td {
+    border: none;
+    padding: 2px 0;
+    vertical-align: bottom;
+    line-height: 2;
+  }
+  td.toc-title {
+    width: 60%;
+    white-space: normal;
+    word-break: normal;
+    padding-right: 4px;
+  }
+  td.toc-dots {
+    width: 30%;
+    overflow: hidden;
+    white-space: nowrap;
+    vertical-align: bottom;
+    color: #555;
+    padding: 0 2px;
+    /* 让点字符对齐到底部，与标题基线一致 */
+    padding-bottom: 2px;
+  }
+  td.toc-page {
+    width: 10%;
+    white-space: nowrap;
+    text-align: right;
+    padding-left: 4px;
+  }
+  tr.lvl-1 td.toc-title { font-weight: 700; font-size: 12pt; padding-left: 0; }
+  tr.lvl-2 td.toc-title { font-weight: normal; font-size: 11pt; padding-left: 2em; }
+  tr.lvl-3 td.toc-title { font-weight: normal; font-size: 10.5pt; padding-left: 4em; color: #333; }
+  a { color: inherit; text-decoration: none; }
+</style>
 """
-    with open(xsl_path, "w", encoding="utf-8") as fh:
-        fh.write(xsl)
 
+    if not headings:
+        return toc_css + "<h1 class='toc-heading'>目&#x3000;&#x3000;录</h1><p style='text-align:center;margin-top:20mm;'>未生成目录条目</p>"
 
-def _write_text(path: str, content: str) -> None:
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write(content)
+    # 归一化层级
+    min_level = min(h["level"] for h in headings)
+    level_offset = min_level - 1
 
-
-def _find_wkhtmltopdf_bin() -> str:
-    env_path = os.getenv("WKHTMLTOPDF_BIN")
-    for candidate in [env_path, _DEFAULT_WKHTMLTOPDF, shutil.which("wkhtmltopdf")]:
-        if candidate and os.path.exists(candidate):
-            return candidate
-    raise HTTPException(status_code=500, detail="wkhtmltopdf 不存在，无法导出 PDF")
-
-
-def _run_wkhtmltopdf(
-    input_html: str,
-    output_pdf: str,
-    options: dict[str, str],
-    toc_xsl: str | None = None,
-) -> None:
-    """
-    调用 wkhtmltopdf 将 HTML 转为 PDF。
-
-    若传入 toc_xsl，则在全局选项之后、正文 input_html 之前
-    插入 toc 子命令，使 wkhtmltopdf 在同一次渲染里生成目录：
-        wkhtmltopdf [global-options] toc --xsl-style-sheet <xsl> <html> <pdf>
-    这样目录中的链接是真正的 PDF 内部跳转，虚线也在同一渲染里输出。
-    """
-    wkhtmltopdf_bin = _find_wkhtmltopdf_bin()
-    cmd = [wkhtmltopdf_bin]
-
-    for key, value in options.items():
-        cmd.append(f"--{key}")
-        if value != "":
-            cmd.append(str(value))
-
-    if toc_xsl:
-        cmd.extend(["toc", "--xsl-style-sheet", toc_xsl])
-
-    cmd.extend([input_html, output_pdf])
-
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    # wkhtmltopdf 正常完成时 exit code 可能是 0 或 1（有警告但 PDF 已生成）。
-    # 只有当输出文件不存在或为空时才视为真正失败。
-    if result.returncode not in (0, 1) or not os.path.exists(output_pdf) or os.path.getsize(output_pdf) == 0:
-        stderr = (result.stderr or "").strip()
-        raise HTTPException(
-            status_code=500,
-            detail=f"wkhtmltopdf 执行失败 (exit={result.returncode}): {stderr}",
+    rows = []
+    for h in headings:
+        display_level = min(max(1, h["level"] - level_offset), 3)
+        hid = html.escape(h["id"])
+        title = html.escape(h["title"])
+        page = html.escape(str(h.get("page", "")))
+        rows.append(
+            f"<tr class='lvl-{display_level}'>"
+            f"<td class='toc-title'><a href='#{hid}'>{title}</a></td>"
+            f"<td class='toc-dots'>{_DOTS}</td>"
+            f"<td class='toc-page'><a href='#{hid}'>{page}</a></td>"
+            f"</tr>"
         )
 
-
-def _merge_pdfs(output_pdf: str, input_pdfs: list[str]) -> None:
-    writer = PdfWriter()
-    for pdf_path in input_pdfs:
-        reader = PdfReader(pdf_path)
-        for page in reader.pages:
-            writer.add_page(page)
-
-    with open(output_pdf, "wb") as fh:
-        writer.write(fh)
+    return (
+        toc_css
+        + "<h1 class='toc-heading'>目&#x3000;&#x3000;录</h1>"
+        + "<table class='toc-table'>"
+        + "".join(rows)
+        + "</table>"
+    )
 
 
-def _safe_unlink(path: str) -> None:
-    if path and os.path.exists(path):
-        os.remove(path)
-
+# ===========================================================================
+# 正文 HTML 构建（含 heading ID 注入）
+# ===========================================================================
 
 _BODY_CSS = """
 <style>
@@ -604,83 +465,31 @@ _BODY_CSS = """
     color: #111;
     padding: 0 24px;
   }
-  p {
-    margin: 8px 0;
-    text-align: justify;
-    text-indent: 2em;
-  }
-  h1 {
-    font-size: 16pt;
-    font-weight: bold;
-    margin: 32px 0 14px 0;
-    text-indent: 0 !important;
-    page-break-after: avoid;
-  }
-  h2 {
-    font-size: 13pt;
-    font-weight: bold;
-    margin: 20px 0 10px 0;
-    text-indent: 0 !important;
-    page-break-after: avoid;
-  }
-  h3 {
-    font-size: 12pt;
-    font-weight: bold;
-    margin: 14px 0 8px 0;
-    text-indent: 0 !important;
-    page-break-after: avoid;
-  }
-  .force-center {
-    text-indent: 0 !important;
-    text-align: center !important;
-    display: block !important;
-    width: 100% !important;
-    margin: 10px 0 !important;
-  }
-  .caption-text {
-    font-weight: bold;
-    font-size: 11pt;
-    color: #333;
-    display: block;
-    margin: 4px 0;
-    text-indent: 0 !important;
-    text-align: center !important;
-  }
-  img {
-    max-width: 90% !important;
-    height: auto !important;
-    display: block;
-    margin: 0 auto;
-  }
-  table {
-    width: 100% !important;
-    margin: 12px auto !important;
-    border-collapse: collapse;
-    border: 1.5px solid #333;
-    text-indent: 0 !important;
-    page-break-inside: avoid;
-  }
-  td, th {
-    border: 1px solid #555 !important;
-    padding: 6px 10px;
-    text-align: center;
-  }
+  p { margin: 8px 0; text-align: justify; text-indent: 2em; }
+  h1 { font-size: 16pt; font-weight: bold; margin: 32px 0 14px 0; text-indent: 0 !important; page-break-after: avoid; }
+  h2 { font-size: 13pt; font-weight: bold; margin: 20px 0 10px 0; text-indent: 0 !important; page-break-after: avoid; }
+  h3 { font-size: 12pt; font-weight: bold; margin: 14px 0 8px 0; text-indent: 0 !important; page-break-after: avoid; }
+  .force-center { text-indent: 0 !important; text-align: center !important; display: block !important; width: 100% !important; margin: 10px 0 !important; }
+  .caption-text { font-weight: bold; font-size: 11pt; color: #333; display: block; margin: 4px 0; text-indent: 0 !important; text-align: center !important; }
+  img { max-width: 90% !important; height: auto !important; display: block; margin: 0 auto; }
+  table { width: 100% !important; margin: 12px auto !important; border-collapse: collapse; border: 1.5px solid #333; text-indent: 0 !important; page-break-inside: avoid; }
+  td, th { border: 1px solid #555 !important; padding: 6px 10px; text-align: center; }
   th { background: #f0f0f0; }
-  .chapter-break {
-    display: block;
-    page-break-before: always;
-    break-before: page;
-    height: 0;
-    margin: 0;
-    padding: 0;
-  }
+  .chapter-break { display: block; page-break-before: always; break-before: page; height: 0; margin: 0; padding: 0; }
 </style>
 """
 
 
-def _build_body_html(output_dir: str, html_files: list[str]) -> str:
+def _build_body_sections(output_dir: str, html_files: list[str]) -> tuple[str, list[dict]]:
+    """
+    处理所有章节 HTML，返回：
+    - body_html: 合并后的正文 HTML（h1/h2/h3 已注入 id 属性）
+    - all_headings: 按出现顺序排列的标题列表，每项含 id/title/level
+    """
     merged_sections: list[str] = []
+    all_headings: list[dict] = []
     prev_top_chapter: str | None = None
+    heading_counter = [0]
 
     for fname in html_files:
         try:
@@ -696,27 +505,27 @@ def _build_body_html(output_dir: str, html_files: list[str]) -> str:
             content = _normalize_src_href_to_file_uri(content, output_dir)
             content = _sanitize_stray_numeric_lines(content)
 
-            # heading-shift：按文件深度将标题层级下移，使合并后 outline 层级正确
             depth = _determine_depth(fname)
             content = _shift_headings(content, shift=depth - 1)
+
+            # 注入 heading id（用于 TOC 跳转链接）
+            content, section_headings = _inject_heading_ids(content, heading_counter)
+            all_headings.extend(section_headings)
 
             content = re.sub(
                 r"<p>\s*(表\s*\d+(\.\d+)?[-\s]\d+[^<]*)\s*</p>",
                 r'<p class="force-center caption-text">\1</p>',
-                content,
-                flags=re.IGNORECASE,
+                content, flags=re.IGNORECASE,
             )
             content = re.sub(
                 r"(<br\s*/?>)\s*(图\s*\d+(\.\d+)?[-\s]\d+[^<]*)",
                 r'\1<span class="caption-text">\2</span>',
-                content,
-                flags=re.IGNORECASE,
+                content, flags=re.IGNORECASE,
             )
             content = re.sub(
                 r"<p(?![^>]*class=)([^>]*)>(\s*<img)",
                 r'<p class="force-center"\1>\2',
-                content,
-                flags=re.IGNORECASE,
+                content, flags=re.IGNORECASE,
             )
 
             cur_top = _top_chapter_key(fname)
@@ -734,15 +543,116 @@ def _build_body_html(output_dir: str, html_files: list[str]) -> str:
         raise HTTPException(status_code=500, detail="所有章节处理失败，无法导出 PDF")
 
     base_href = Path(output_dir).resolve().as_uri() + "/"
-    return (
+    body_html = (
         "<!DOCTYPE html><html><head>"
         "<meta charset='utf-8'>"
         f"<base href='{base_href}'>"
         f"{_BODY_CSS}"
         "</head><body>"
-        f"{''.join(merged_sections)}"
-        "</body></html>"
+        + "".join(merged_sections)
+        + "</body></html>"
     )
+    return body_html, all_headings
+
+
+def _build_combined_html(output_dir: str, headings_with_pages: list[dict], body_sections_html: str) -> str:
+    """
+    构建目录+正文合并 HTML（同一个文档，href="#hN" 跳转有效）。
+    body_sections_html 是 _build_body_sections 返回的完整 HTML，
+    此处提取其 <body> 内容并合并到 TOC 之后。
+    """
+    toc_section = _build_toc_section(headings_with_pages)
+
+    # 提取正文 body 内容
+    body_content = _extract_body_content(body_sections_html)
+
+    base_href_m = re.search(r"<base href='([^']+)'", body_sections_html)
+    base_href = base_href_m.group(1) if base_href_m else ""
+
+    combined_css = """
+<style>
+  /* 目录页样式 */
+  .toc-page-wrapper {
+    padding: 18mm 20mm;
+  }
+  /* 目录与正文之间强制分页 */
+  .toc-body-break {
+    display: block;
+    page-break-before: always;
+    break-before: page;
+    height: 0; margin: 0; padding: 0;
+  }
+</style>
+"""
+
+    return (
+        "<!DOCTYPE html><html><head>"
+        "<meta charset='utf-8'>"
+        + (f"<base href='{base_href}'>" if base_href else "")
+        + combined_css
+        + _BODY_CSS
+        + "</head><body>"
+        + f"<div class='toc-page-wrapper'>{toc_section}</div>"
+        + "<div class='toc-body-break'></div>"
+        + body_content
+        + "</body></html>"
+    )
+
+
+# ===========================================================================
+# wkhtmltopdf 调用
+# ===========================================================================
+
+def _find_wkhtmltopdf_bin() -> str:
+    env_path = os.getenv("WKHTMLTOPDF_BIN")
+    for candidate in [env_path, _DEFAULT_WKHTMLTOPDF, shutil.which("wkhtmltopdf")]:
+        if candidate and os.path.exists(candidate):
+            return candidate
+    raise HTTPException(status_code=500, detail="wkhtmltopdf 不存在，无法导出 PDF")
+
+
+def _run_wkhtmltopdf(
+    input_html: str,
+    output_pdf: str,
+    options: dict[str, str],
+    dump_outline: str | None = None,
+) -> None:
+    wkhtmltopdf_bin = _find_wkhtmltopdf_bin()
+    cmd = [wkhtmltopdf_bin]
+
+    for key, value in options.items():
+        cmd.append(f"--{key}")
+        if value != "":
+            cmd.append(str(value))
+
+    if dump_outline:
+        cmd.extend(["--dump-outline", dump_outline])
+
+    cmd.extend([input_html, output_pdf])
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    # wkhtmltopdf 有警告时 exit code 为 1，但 PDF 已正常生成
+    if result.returncode not in (0, 1) or not os.path.exists(output_pdf) or os.path.getsize(output_pdf) == 0:
+        stderr = (result.stderr or "").strip()
+        raise HTTPException(
+            status_code=500,
+            detail=f"wkhtmltopdf 执行失败 (exit={result.returncode}): {stderr}",
+        )
+
+
+def _merge_pdfs(output_pdf: str, input_pdfs: list[str]) -> None:
+    writer = PdfWriter()
+    for pdf_path in input_pdfs:
+        reader = PdfReader(pdf_path)
+        for page in reader.pages:
+            writer.add_page(page)
+    with open(output_pdf, "wb") as fh:
+        writer.write(fh)
+
+
+def _safe_unlink(path: str) -> None:
+    if path and os.path.exists(path):
+        os.remove(path)
 
 
 def _common_pdf_options() -> dict[str, str]:
@@ -758,6 +668,10 @@ def _common_pdf_options() -> dict[str, str]:
         "footer-spacing": "4",
     }
 
+
+# ===========================================================================
+# 主导出接口
+# ===========================================================================
 
 @router.get("/{project_id}/export-full-pdf")
 def export_full_project_pdf(project_id: str):
@@ -795,59 +709,74 @@ def export_full_project_pdf(project_id: str):
     project_name = _read_project_name(project_id)
     date_text = _current_year_month()
 
-    cover_html_path = os.path.join(project_export_dir, f"cover_{ts}.html")
-    body_html_path  = os.path.join(project_export_dir, f"body_{ts}.html")
-    toc_xsl_path    = os.path.join(project_export_dir, f"toc_{ts}.xsl")
+    cover_html_path    = os.path.join(project_export_dir, f"cover_{ts}.html")
+    body_html_path     = os.path.join(project_export_dir, f"body_{ts}.html")
+    combined_html_path = os.path.join(project_export_dir, f"combined_{ts}.html")
+    outline_xml_path   = os.path.join(project_export_dir, f"outline_{ts}.xml")
 
-    cover_pdf_path  = os.path.join(project_export_dir, f"cover_{ts}.pdf")
-    body_toc_pdf_path = os.path.join(project_export_dir, f"body_toc_{ts}.pdf")
+    cover_pdf_path    = os.path.join(project_export_dir, f"cover_{ts}.pdf")
+    body_pdf_path     = os.path.join(project_export_dir, f"body_{ts}.pdf")   # 仅用于获取页码
+    combined_pdf_path = os.path.join(project_export_dir, f"combined_{ts}.pdf")
 
     temp_files = [
-        cover_html_path,
-        body_html_path,
-        toc_xsl_path,
-        cover_pdf_path,
-        body_toc_pdf_path,
+        cover_html_path, body_html_path, combined_html_path, outline_xml_path,
+        cover_pdf_path, body_pdf_path, combined_pdf_path,
     ]
 
     try:
+        # ── Step 0: 封面 ──────────────────────────────────────────────
         cover_html = _build_cover_html(
             project_name=project_name,
             cover_image_uri=Path(cover_image_path).resolve().as_uri(),
             badge_image_uri=Path(badge_image_path).resolve().as_uri(),
             date_text=date_text,
         )
-        body_html = _build_body_html(output_dir, html_files)
-
         _write_text(cover_html_path, cover_html)
-        _write_text(body_html_path, body_html)
-        _write_toc_xsl(toc_xsl_path)
 
         cover_options = {
             **_common_pdf_options(),
-            "margin-top": "8mm",
-            "margin-bottom": "18mm",
-            "margin-left": "10mm",
-            "margin-right": "10mm",
+            "margin-top": "8mm", "margin-bottom": "18mm",
+            "margin-left": "10mm", "margin-right": "10mm",
         }
-        # 正文 + 目录在同一次渲染里完成：
-        #   wkhtmltopdf [options] toc --xsl-style-sheet toc.xsl body.html output.pdf
-        # --outline / --outline-depth 让 wkhtmltopdf 构建书签树，toc 子命令依赖它
+        _run_wkhtmltopdf(cover_html_path, cover_pdf_path, cover_options)
+
+        # ── Step 1: 处理正文，注入 heading id ─────────────────────────
+        body_html, all_headings = _build_body_sections(output_dir, html_files)
+        _write_text(body_html_path, body_html)
+
+        # ── Step 2: 渲染正文（仅用于 dump-outline 获取页码）────────────
         body_options = {
             **_common_pdf_options(),
-            "margin-top": "18mm",
-            "margin-bottom": "18mm",
-            "margin-left": "20mm",
-            "margin-right": "20mm",
-            "outline": "",
-            "outline-depth": "3",
+            "margin-top": "18mm", "margin-bottom": "18mm",
+            "margin-left": "20mm", "margin-right": "20mm",
         }
+        _run_wkhtmltopdf(body_html_path, body_pdf_path, body_options, dump_outline=outline_xml_path)
 
-        _run_wkhtmltopdf(cover_html_path, cover_pdf_path, cover_options)
-        _run_wkhtmltopdf(body_html_path, body_toc_pdf_path, body_options, toc_xsl=toc_xsl_path)
+        # ── Step 3: 将 dump-outline 页码写入 headings ─────────────────
+        outline_pages = _parse_outline_pages(outline_xml_path)
+        # 按顺序匹配：outline 条目顺序 = 正文中标题出现顺序
+        for i, h in enumerate(all_headings):
+            h["page"] = outline_pages[i] if i < len(outline_pages) else ""
 
-        _merge_pdfs(final_pdf, [cover_pdf_path, body_toc_pdf_path])
+        # ── Step 4: 构建目录+正文合并 HTML，一次渲染保证跳转链接有效 ──
+        combined_html = _build_combined_html(output_dir, all_headings, body_html)
+        _write_text(combined_html_path, combined_html)
+
+        combined_options = {
+            **_common_pdf_options(),
+            "margin-top": "18mm", "margin-bottom": "18mm",
+            "margin-left": "20mm", "margin-right": "20mm",
+        }
+        _run_wkhtmltopdf(combined_html_path, combined_pdf_path, combined_options)
+
+        # ── Step 5: 合并封面 + 目录正文 ───────────────────────────────
+        _merge_pdfs(final_pdf, [cover_pdf_path, combined_pdf_path])
         return FileResponse(final_pdf, filename=final_name, media_type="application/pdf")
     finally:
         for path in temp_files:
             _safe_unlink(path)
+
+
+def _write_text(path: str, content: str) -> None:
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(content)
