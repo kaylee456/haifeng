@@ -389,7 +389,7 @@ def _toc_css() -> str:
   }
   .toc-pg {
     position: absolute;
-    right: 0;
+    right: -1mm;
     top: 0;
     background: #fff;
     padding-left: 6px;
