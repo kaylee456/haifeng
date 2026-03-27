@@ -400,8 +400,7 @@ def _write_toc_xsl(xsl_path: str) -> None:
     xsl = r"""<?xml version="1.0" encoding="UTF-8"?>
 <xsl:stylesheet version="1.0"
     xmlns:xsl="http://www.w3.org/1999/XSL/Transform"
-    xmlns:outline="http://wkhtmltopdf.org/outline"
-    xmlns="http://www.w3.org/1999/xhtml">
+    xmlns:outline="http://wkhtmltopdf.org/outline">
   <xsl:output method="html" encoding="UTF-8" indent="no"/>
 
   <xsl:template match="outline:outline">
@@ -569,14 +568,15 @@ def _run_wkhtmltopdf(
 
     cmd.extend([input_html, output_pdf])
 
-    try:
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
-    except subprocess.CalledProcessError as exc:  # pragma: no cover - depends on runtime binary
-        stderr = (exc.stderr or "").strip()
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    # wkhtmltopdf 正常完成时 exit code 可能是 0 或 1（有警告但 PDF 已生成）。
+    # 只有当输出文件不存在或为空时才视为真正失败。
+    if result.returncode not in (0, 1) or not os.path.exists(output_pdf) or os.path.getsize(output_pdf) == 0:
+        stderr = (result.stderr or "").strip()
         raise HTTPException(
             status_code=500,
-            detail=f"wkhtmltopdf 执行失败: {stderr or exc}",
-        ) from exc
+            detail=f"wkhtmltopdf 执行失败 (exit={result.returncode}): {stderr}",
+        )
 
 
 def _merge_pdfs(output_pdf: str, input_pdfs: list[str]) -> None:
@@ -832,13 +832,15 @@ def export_full_project_pdf(project_id: str):
         }
         # 正文 + 目录在同一次渲染里完成：
         #   wkhtmltopdf [options] toc --xsl-style-sheet toc.xsl body.html output.pdf
-        # 这样 wkhtmltopdf 自动建立真正的 PDF 内部跳转链接，虚线在同一渲染里输出
+        # --outline / --outline-depth 让 wkhtmltopdf 构建书签树，toc 子命令依赖它
         body_options = {
             **_common_pdf_options(),
             "margin-top": "18mm",
             "margin-bottom": "18mm",
             "margin-left": "20mm",
             "margin-right": "20mm",
+            "outline": "",
+            "outline-depth": "3",
         }
 
         _run_wkhtmltopdf(cover_html_path, cover_pdf_path, cover_options)
