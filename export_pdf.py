@@ -386,6 +386,7 @@ def _parse_outline_items(xml_path: str) -> list[dict]:
     """
     解析 wkhtmltopdf dump-outline 生成的 XML，返回扁平化的目录条目列表。
     从 outline 根的直接子节点出发，逐级递归，level 从 1 起算。
+    同时收集 link 属性，供目录条目生成可点击跳转链接。
     """
     if not os.path.exists(xml_path):
         return []
@@ -397,9 +398,10 @@ def _parse_outline_items(xml_path: str) -> list[dict]:
         items: list[dict] = []
         for child in node.findall("outline:item", _OUTLINE_NS):
             title = (child.attrib.get("title") or "").strip()
-            page = (child.attrib.get("page") or "").strip()
+            page  = (child.attrib.get("page")  or "").strip()
+            link  = (child.attrib.get("link")  or "").strip()
             if title:
-                items.append({"title": title, "page": page, "level": level})
+                items.append({"title": title, "page": page, "link": link, "level": level})
             items.extend(walk(child, level + 1))
         return items
 
@@ -407,11 +409,18 @@ def _parse_outline_items(xml_path: str) -> list[dict]:
 
 
 def _build_toc_html(items: list[dict]) -> str:
+    """
+    构建目录 HTML。
+
+    布局采用真实 <table> 三列（标题 | 虚线 | 页码），
+    避免旧版 wkhtmltopdf WebKit 对 flex/display:table-cell 的兼容问题。
+    虚线列用 background-image radial-gradient 实现；
+    页码列包裹在 <a href="link"> 中实现点击跳转。
+    """
     toc_css = """
 <style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
   html, body {
-    margin: 0;
-    padding: 0;
     color: #111;
     font-family: "SimSun", "宋体", "Microsoft YaHei", sans-serif;
     font-size: 12pt;
@@ -419,59 +428,64 @@ def _build_toc_html(items: list[dict]) -> str:
   }
   body {
     padding: 18mm 20mm;
-    box-sizing: border-box;
   }
-  .toc-title {
-    margin: 0 0 12mm;
+  h1.toc-heading {
     text-align: center;
     font-size: 18pt;
     font-weight: 700;
     letter-spacing: 0.4em;
+    margin-bottom: 10mm;
   }
-  .toc-list {
-    list-style: none;
-    margin: 0;
-    padding: 0;
+  table.toc-table {
+    width: 100%;
+    border-collapse: collapse;
+    border: none;
+    table-layout: fixed;
   }
-  .toc-item {
-    display: flex;
-    align-items: baseline;
-    gap: 8px;
-    margin: 4px 0;
-    line-height: 1.8;
+  table.toc-table td {
+    border: none;
+    padding: 3px 0;
+    vertical-align: bottom;
+    line-height: 1.9;
   }
-  .toc-text {
-    background: #fff;
-    position: relative;
-    z-index: 1;
-    padding-right: 6px;
+  /* 标题列：固定宽度，不换行防止挤压虚线列 */
+  td.toc-title {
+    width: 60%;
+    white-space: normal;
+    word-break: normal;
+    padding-right: 4px;
+  }
+  /* 虚线列：剩余宽度，用 radial-gradient 画圆点 */
+  td.toc-dots {
+    width: 30%;
+    border-bottom: none;
+    background-image: radial-gradient(circle, #555 1px, transparent 1px);
+    background-size: 6px 1px;
+    background-repeat: repeat-x;
+    background-position: 0 bottom;
+  }
+  /* 页码列：固定宽度，右对齐 */
+  td.toc-page {
+    width: 10%;
     white-space: nowrap;
-  }
-  .toc-dots {
-    flex: 1;
-    border-bottom: 1px dotted #444;
-    transform: translateY(-2px);
-  }
-  .toc-page {
-    min-width: 22px;
     text-align: right;
-    background: #fff;
-    position: relative;
-    z-index: 1;
-    padding-left: 6px;
-    white-space: nowrap;
+    padding-left: 4px;
   }
-  .lvl-1 { padding-left: 0;    font-weight: 700; }
-  .lvl-2 { padding-left: 1.5em; font-weight: normal; }
-  .lvl-3 { padding-left: 3em;   font-weight: normal; }
+  /* 层级缩进与字重 */
+  tr.lvl-1 td.toc-title { font-weight: 700; font-size: 12pt; padding-left: 0; }
+  tr.lvl-2 td.toc-title { font-weight: normal; font-size: 11pt; padding-left: 2em; }
+  tr.lvl-3 td.toc-title { font-weight: normal; font-size: 10.5pt; padding-left: 4em; color: #222; }
+  /* 跳转链接样式：颜色与正文一致，不显示下划线 */
+  a.toc-link { color: inherit; text-decoration: none; }
+  a.toc-link:hover { text-decoration: underline; }
 </style>
 """
 
     if not items:
-        body_html = """
-<h1 class="toc-title">目 录</h1>
-<p style="text-align:center;margin-top:20mm;">未生成目录条目</p>
-"""
+        body_html = (
+            "<h1 class='toc-heading'>目&#x3000;&#x3000;录</h1>"
+            "<p style='text-align:center;margin-top:20mm;'>未生成目录条目</p>"
+        )
         return _html_shell("目录", body_html, toc_css)
 
     # 归一化：让实际最小层级映射到 lvl-1
@@ -481,23 +495,32 @@ def _build_toc_html(items: list[dict]) -> str:
     rows = []
     for item in items:
         display_level = min(max(1, int(item["level"]) - level_offset), 3)
+        title_escaped = html.escape(str(item["title"]))
+        page_escaped  = html.escape(str(item["page"]))
+        link = str(item.get("link") or "").strip()
+
+        # 标题列内容
+        title_cell = title_escaped
+
+        # 页码列：有跳转链接则包裹 <a>
+        if link:
+            page_cell = f'<a class="toc-link" href="{html.escape(link)}">{page_escaped}</a>'
+        else:
+            page_cell = page_escaped
+
         rows.append(
-            "<li class='toc-item lvl-{level}'>"
-            "<span class='toc-text'>{title}</span>"
-            "<span class='toc-dots'></span>"
-            "<span class='toc-page'>{page}</span>"
-            "</li>".format(
-                level=display_level,
-                title=html.escape(str(item["title"])),
-                page=html.escape(str(item["page"])),
-            )
+            f"<tr class='lvl-{display_level}'>"
+            f"<td class='toc-title'>{title_cell}</td>"
+            f"<td class='toc-dots'></td>"
+            f"<td class='toc-page'>{page_cell}</td>"
+            f"</tr>"
         )
 
     body_html = (
-        "<h1 class='toc-title'>目 录</h1>"
-        "<ul class='toc-list'>"
+        "<h1 class='toc-heading'>目&#x3000;&#x3000;录</h1>"
+        "<table class='toc-table'>"
         + "".join(rows)
-        + "</ul>"
+        + "</table>"
     )
     return _html_shell("目录", body_html, toc_css)
 
