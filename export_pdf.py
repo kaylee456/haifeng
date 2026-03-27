@@ -677,15 +677,20 @@ _BODY_CSS = """
     page-break-after: avoid;
   }
 
-  /* outline 锚点：视觉隐藏，只被 wkhtmltopdf outline 引擎识别 */
+  /*
+   * outline 锚点：视觉隐藏，但 wkhtmltopdf outline 引擎仍可识别。
+   * 注意：不能设置 font-size:0，否则 wkhtmltopdf 会跳过该标题，
+   * 导致 dump-outline XML 为空、目录无条目。
+   * 用 height:0 + overflow:hidden + color:transparent 做视觉隐藏。
+   */
   .outline-anchor {
+    display: block !important;
     margin: 0 !important;
     padding: 0 !important;
     height: 0 !important;
     line-height: 0 !important;
-    font-size: 0 !important;
-    color: transparent !important;
     overflow: hidden !important;
+    color: transparent !important;
     border: 0 !important;
   }
 
