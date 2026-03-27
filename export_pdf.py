@@ -8,13 +8,14 @@ PDF 全量导出模块
 2. 解析 outline XML，构建目录 HTML
 3. 分别渲染封面、目录、正文 PDF，最后合并
 
-关键修复：
-- 章节 HTML 的原有 h1/h2/h3 标签会干扰 outline 层级，
-  故在合并前先将章节内容里的 h1-h6 降格为 div.sec-hX，
-  仅保留由 _build_hidden_outline_heading 注入的隐藏 outline 锚点标题，
-  以确保 wkhtmltopdf 的 outline 层级与文件名层级一致。
-- _parse_outline_items 遍历时从 level=1 起算，
-  _build_toc_html 构建时归一化偏移，保证第一级条目缩进为 lvl-1。
+outline 层级策略：
+- 章节内容里原有的 h1-h6 全部降格为 div.sec-hX（样式不变，但
+  不被 wkhtmltopdf outline 引擎识别），避免污染目录结构。
+- 每节开头注入一个**可见**的 <h1>/<h2>/<h3> 节标题（由文件名深度决定层级），
+  作为 wkhtmltopdf 唯一 outline 来源，同时也是文档中的正式章节标题。
+  注意：wkhtmltopdf 会忽略 height:0 / font-size:0 / overflow:hidden 的标题，
+  因此不能用 CSS 完全隐藏，必须保留可见布局。
+- _build_toc_html 归一化层级偏移，保证最浅层映射到 lvl-1。
 """
 
 from datetime import datetime
@@ -240,6 +241,22 @@ def _determine_heading_level(fname: str) -> int:
     return min(len(parts), 3)
 
 
+def _strip_leading_section_heading(content: str) -> str:
+    """
+    去除内容开头由 _demote_content_headings 生成的第一个 div.sec-hX。
+
+    每节已由 _build_section_heading_tag 注入可见标题，若内容里仍保留
+    原始章节标题（降格后的 div），会导致标题在 PDF 中重复出现。
+    """
+    return re.sub(
+        r"^\s*<div[^>]*class=[\"'][^\"']*sec-h[1-6][^\"']*[\"'][^>]*>.*?</div>\s*",
+        "",
+        content,
+        count=1,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+
 def _sanitize_stray_numeric_lines(content: str) -> str:
     """
     去除章节体内孤立的纯数字段落（目录残留序号）。
@@ -411,17 +428,20 @@ def _build_cover_html(
     return _html_shell("封面", body_html, cover_css)
 
 
-def _build_hidden_outline_heading(title: str, level: int) -> str:
+def _build_section_heading_tag(title: str, level: int) -> str:
     """
-    注入一个对用户不可见、但会被 wkhtmltopdf outline 引擎识别的标题锚点。
-    使用真实的 <h1>/<h2>/<h3> 标签，依靠 CSS 将其视觉隐藏（高度0、字号0）。
-    这是 outline 层级的唯一来源；章节内容里的原生标题已被 _demote_content_headings 替换。
+    生成每节开头的可见章节标题标签（<h1>/<h2>/<h3>）。
+
+    这是 wkhtmltopdf outline 的唯一来源——必须是正常可见元素，
+    任何 height:0 / font-size:0 / overflow:hidden 都会让 wkhtmltopdf
+    跳过该标题，导致 dump-outline XML 为空、目录无条目。
+
+    章节内容里原有的 h1-h6 已由 _demote_content_headings 降格为 div.sec-hX，
+    不再污染 outline。
     """
     tag = f"h{max(1, min(level, 3))}"
     safe_title = html.escape(title)
-    return (
-        f'<{tag} class="outline-anchor outline-level-{level}">{safe_title}</{tag}>'
-    )
+    return f'<{tag} class="sec-heading sec-heading-{level}">{safe_title}</{tag}>'
 
 
 def _parse_outline_items(xml_path: str) -> list[dict]:
@@ -678,20 +698,33 @@ _BODY_CSS = """
   }
 
   /*
-   * outline 锚点：视觉隐藏，但 wkhtmltopdf outline 引擎仍可识别。
-   * 注意：不能设置 font-size:0，否则 wkhtmltopdf 会跳过该标题，
-   * 导致 dump-outline XML 为空、目录无条目。
-   * 用 height:0 + overflow:hidden + color:transparent 做视觉隐藏。
+   * 章节标题：可见元素，wkhtmltopdf outline 引擎从此处建立目录层级。
+   * 禁止用任何 CSS 隐藏（height:0 / font-size:0 / overflow:hidden），
+   * 否则 wkhtmltopdf 会跳过，导致 dump-outline XML 为空。
    */
-  .outline-anchor {
-    display: block !important;
-    margin: 0 !important;
-    padding: 0 !important;
-    height: 0 !important;
-    line-height: 0 !important;
-    overflow: hidden !important;
-    color: transparent !important;
-    border: 0 !important;
+  h1.sec-heading {
+    font-size: 18pt;
+    font-weight: bold;
+    margin: 0 0 16px 0;
+    text-indent: 0 !important;
+    page-break-after: avoid;
+    color: #111;
+  }
+  h2.sec-heading {
+    font-size: 14pt;
+    font-weight: bold;
+    margin: 28px 0 12px 0;
+    text-indent: 0 !important;
+    page-break-after: avoid;
+    color: #111;
+  }
+  h3.sec-heading {
+    font-size: 12pt;
+    font-weight: bold;
+    margin: 18px 0 8px 0;
+    text-indent: 0 !important;
+    page-break-after: avoid;
+    color: #111;
   }
 
   .force-center {
@@ -765,6 +798,8 @@ def _build_body_html(output_dir: str, html_files: list[str]) -> str:
 
             # 将章节内原生 h1-h6 降格为 div.sec-hX，避免干扰 outline 层级
             content = _demote_content_headings(content)
+            # 去掉内容开头的第一个降格标题，避免与注入的 sec-heading 重复
+            content = _strip_leading_section_heading(content)
 
             content = re.sub(
                 r"<p>\s*(表\s*\d+(\.\d+)?[-\s]\d+[^<]*)\s*</p>",
@@ -791,9 +826,9 @@ def _build_body_html(output_dir: str, html_files: list[str]) -> str:
             prev_top_chapter = cur_top
 
             heading_level = _determine_heading_level(fname)
-            outline_heading = _build_hidden_outline_heading(section_title, heading_level)
+            section_heading = _build_section_heading_tag(section_title, heading_level)
             merged_sections.append(
-                f'<section data-source="{html.escape(fname)}">{outline_heading}{content}</section>'
+                f'<section data-source="{html.escape(fname)}">{section_heading}{content}</section>'
             )
         except Exception as exc:
             print(f"[export_pdf] Error processing {fname}: {exc}")
