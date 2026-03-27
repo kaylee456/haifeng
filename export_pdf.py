@@ -218,6 +218,17 @@ def _sanitize_stray_numeric_lines(content: str) -> str:
     return re.sub(r"<p>\s*\d+(\.\d+)?\s*</p>", "", content, flags=re.IGNORECASE)
 
 
+def _strip_inline_line_height(content: str) -> str:
+    """从所有标签的内联 style 中删除 line-height 声明，让全局 CSS 生效。"""
+    def remove_lh(m: re.Match) -> str:
+        style = re.sub(r"line-height\s*:[^;\"']+;?\s*", "", m.group(1), flags=re.IGNORECASE)
+        style = style.strip().rstrip(";").strip()
+        if style:
+            return f' style="{style}"'
+        return ""
+    return re.sub(r'\s+style\s*=\s*"([^"]*)"', remove_lh, content, flags=re.IGNORECASE)
+
+
 def _read_project_name(project_id: str) -> str:
     template_path = _resolve_existing_path(
         f"{_LEGACY_ROOT}/config/target_project_template.json",
@@ -525,6 +536,7 @@ def _build_body_sections(output_dir: str, html_files: list[str]) -> tuple[str, l
             content = _rewrite_spic_urls_to_local_file(content)
             content = _normalize_src_href_to_file_uri(content, output_dir)
             content = _sanitize_stray_numeric_lines(content)
+            content = _strip_inline_line_height(content)
 
             depth = _determine_depth(fname)
             content = _shift_headings(content, shift=depth - 1)
