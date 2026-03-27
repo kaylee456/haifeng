@@ -401,10 +401,37 @@ def _toc_css() -> str:
     text-align: right !important;
     padding-left: 4px !important;
   }
-  tr.lvl-1 td.toc-title { font-weight: 700 !important;   font-size: 12pt !important;   padding-left: 0 !important; }
-  tr.lvl-2 td.toc-title { font-weight: normal !important; font-size: 11pt !important;   padding-left: 2em !important; }
-  tr.lvl-3 td.toc-title { font-weight: normal !important; font-size: 10.5pt !important; padding-left: 4em !important; color: #333; }
+  tr.lvl-1 td.toc-title { font-weight: 700 !important;   font-size: 12pt !important; padding-left: 0 !important; }
+  tr.lvl-2 td.toc-title { font-weight: normal !important; font-size: 12pt !important; padding-left: 2em !important; }
+  tr.lvl-3 td.toc-title { font-weight: normal !important; font-size: 12pt !important; padding-left: 4em !important; }
 """
+
+
+def _toc_display_level(title: str) -> int:
+    """
+    从标题文字推断目录显示层级（1/2/3）。
+
+    规则（按优先级）：
+      1. 以"第X章"或"第X节"开头 → lvl-1（章级）
+      2. 编号含两个及以上小数点，如 6.1.1 → lvl-3
+      3. 编号含一个小数点，如 6.1 / 2.1 → lvl-2
+      4. 纯数字编号开头（1. / 2. / 3.）→ lvl-2
+      5. 其他 → lvl-2（保底）
+    """
+    t = title.strip()
+    # 第X章 / 第X节
+    if re.match(r'^第[〇一二三四五六七八九十百千\d]+[章节篇]', t):
+        return 1
+    # X.Y.Z 三级编号
+    if re.match(r'^\d+\.\d+\.\d+', t):
+        return 3
+    # X.Y 二级编号
+    if re.match(r'^\d+\.\d+', t):
+        return 2
+    # 纯数字编号：1. 2. 3.
+    if re.match(r'^\d+[.．、]', t):
+        return 2
+    return 2
 
 
 def _build_toc_entries(headings: list[dict]) -> str:
@@ -424,12 +451,9 @@ def _build_toc_entries(headings: list[dict]) -> str:
     if not headings:
         return "<p style='text-align:center;padding-top:20mm;'>未生成目录条目</p>"
 
-    min_level = min(h["level"] for h in headings)
-    level_offset = min_level - 1
-
     rows = []
     for h in headings:
-        display_level = min(max(1, h["level"] - level_offset), 3)
+        display_level = _toc_display_level(h["title"])
         title = html.escape(h["title"])
         page  = html.escape(str(h.get("page", "")))
         rows.append(
