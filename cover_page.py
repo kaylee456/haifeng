@@ -67,16 +67,31 @@ def _build_cover_html(
     display: block;
   }
 
+  /*
+   * .cover-content takes all remaining vertical space below the badge
+   * (flex: 1) and centers its children as a group on the vertical axis.
+   * This shifts the title + image + footer block to the visual centre
+   * of the page rather than leaving it clustered at the top.
+   */
+  .cover-content {
+    flex: 1;
+    width: 100%;
+    max-width: 900px;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+  }
+
   /* Shared constraints for the three content blocks */
   .cover-title-box,
   .cover-image-box,
   .cover-footer-box {
     width: 100%;
-    max-width: 900px;
   }
 
   .cover-title-box {
-    padding: 3rem 1rem 2rem;
+    padding: 1rem 1rem 1.5rem;
     text-align: center;
   }
   .cover-title-main,
@@ -89,7 +104,6 @@ def _build_cover_html(
   }
 
   .cover-image-box {
-    margin-top: 1rem;
     padding: 1rem;
     text-align: center;
   }
@@ -102,15 +116,15 @@ def _build_cover_html(
   }
 
   /*
-   * Footer: margin-top: auto consumes all remaining space in the
-   * flex column, pinning it to the bottom of the page while
-   * keeping it in normal document flow (safe for PDF renderers).
+   * Footer sits directly below the image as part of the centred group.
+   * margin-top: auto pushes it away from the image to the bottom edge
+   * of .cover-content, so the group reads: [title][image]…[footer].
    */
   .cover-footer-box {
     margin-top: auto;
     width: 100%;
     text-align: center;
-    padding: 1rem 0;
+    padding: 1rem 0 0;
   }
 
   .cover-company {
@@ -132,16 +146,18 @@ def _build_cover_html(
   <div class="cover-badge">
     <img src="{html_module.escape(badge_image_uri)}" alt="封面角标" />
   </div>
-  <div class="cover-title-box">
-    <div class="cover-title-main">{html_module.escape(project_name)}</div>
-    <div class="cover-title-sub">海上工程施工组织总设计</div>
-  </div>
-  <div class="cover-image-box">
-    <img src="{html_module.escape(cover_image_uri)}" alt="封面大图" />
-  </div>
-  <div class="cover-footer-box">
-    <div class="cover-company">山东电力工程咨询院有限公司</div>
-    <div class="cover-date">{html_module.escape(date_text)}</div>
+  <div class="cover-content">
+    <div class="cover-title-box">
+      <div class="cover-title-main">{html_module.escape(project_name)}</div>
+      <div class="cover-title-sub">海上工程施工组织总设计</div>
+    </div>
+    <div class="cover-image-box">
+      <img src="{html_module.escape(cover_image_uri)}" alt="封面大图" />
+    </div>
+    <div class="cover-footer-box">
+      <div class="cover-company">山东电力工程咨询院有限公司</div>
+      <div class="cover-date">{html_module.escape(date_text)}</div>
+    </div>
   </div>
 </div>
 """
