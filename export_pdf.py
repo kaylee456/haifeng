@@ -554,11 +554,6 @@ def _build_body_sections(output_dir: str, html_files: list[str]) -> tuple[str, l
                 r'\1<span class="caption-text">\2</span>',
                 content, flags=re.IGNORECASE,
             )
-            content = re.sub(
-                r"<p(?![^>]*class=)([^>]*)>(\s*<img)",
-                r'<p class="force-center"\1>\2',
-                content, flags=re.IGNORECASE,
-            )
 
             cur_top = _top_chapter_key(fname)
             if prev_top_chapter is not None and cur_top != prev_top_chapter:
